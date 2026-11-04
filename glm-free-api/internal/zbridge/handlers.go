@@ -1,0 +1,810 @@
+package zbridge
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+)
+
+func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Model           string          `json:"model"`
+		Messages        json.RawMessage `json:"messages"`
+		Stream          *bool           `json:"stream"`
+		Reasoning       *bool           `json:"reasoning"`
+		Thinking        json.RawMessage `json:"thinking"`
+		WebSearch       *bool           `json:"webSearch"`
+		Search          *bool           `json:"search"`
+		AdvancedSearch  *bool           `json:"advancedSearch"`
+		Tools           json.RawMessage `json:"tools"`
+		ToolChoice      json.RawMessage `json:"tool_choice"`
+		ReasoningEffort string          `json:"reasoning_effort"`
+	}
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, 400, formatOpenAIError("Failed to read body", "invalid_request_error", nil))
+		return
+	}
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		writeJSON(w, 400, formatOpenAIError("Invalid JSON", "invalid_request_error", nil))
+		return
+	}
+
+	model := body.Model
+	if model == "" {
+		model = "glm-5"
+	}
+
+	var messages []Message
+	if err := json.Unmarshal(body.Messages, &messages); err != nil || len(messages) == 0 {
+		writeJSON(w, 400, formatOpenAIError("messages is required and must be an array", "invalid_request_error", nil))
+		return
+	}
+
+	// Issue #41: fail fast while the Aliyun WAF blocks this server's
+	// egress IP — before a pooled session is drawn, before vision upload,
+	// and before a captcha burns a harvested device token.
+	if RejectIfWAFBlocked(w) {
+		return
+	}
+
+	// ── Vision: extract image_url parts, upload them to Z.AI, strip them ──
+	// from the messages. cleanedMessages is byte-identical to body.Messages
+	// when the request carries no images (the common case).
+	cleanedMessages, files, vErr := processVisionMessages(r.Context(), body.Messages)
+	if vErr != nil {
+		writeJSON(w, 400, formatOpenAIError(vErr.Error(), "invalid_request_error", nil))
+		return
+	}
+	if len(files) > 0 {
+		if !modelSupportsVision(model) {
+			log.Printf("[Vision] %d image(s) attached but model %q does not advertise vision support; forwarding anyway", len(files), model)
+		}
+		// Re-parse the cleaned (text-only) messages for prompt building.
+		var localMsgs []Message
+		if err := json.Unmarshal(cleanedMessages, &localMsgs); err == nil {
+			messages = localMsgs
+		}
+	}
+
+	stream := true
+	if body.Stream != nil {
+		stream = *body.Stream
+	}
+
+	// Stateless request: run it on a THROWAWAY chat session (ported from the
+	// DeepseekFreeAPI reference). Async mode takes a pre-made session from
+	// the standing pool batch; sync mode mints one on the spot. Either way
+	// the chat is deleted on Z.AI once the response is fully processed
+	// (deferred below), so no server-side history survives the request —
+	// this is what keeps the account from accumulating dead sessions and
+	// stops stale server-side context from rotting later requests.
+	chatID, pooled, err := AcquireStatelessSession(r.Context())
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return // client gone; nothing to answer
+		}
+		writeJSON(w, 503, formatOpenAIError(err.Error(), "server_error", "shutting_down"))
+		return
+	}
+	defer ReleaseStatelessSession(chatID, pooled)
+	requestId := generateID()
+
+	// ── Agent mode: transform tools & roles for Z.AI compatibility ──
+	// Modern shim (default): one XML-sectioned prompt in a single user message.
+	// Legacy shim: [ROLE: ...] rewritten user messages + tool contract message.
+	// Operates on the cleaned (image-stripped) messages.
+	var transformedMessages json.RawMessage = cleanedMessages
+	if config.AgentMode {
+		if tm, err := agentTransformMessages(cleanedMessages, body.Tools); err == nil {
+			transformedMessages = tm
+			// Re-parse so local `messages` reflects the rewritten content
+			var localMsgs []Message
+			if err := json.Unmarshal(tm, &localMsgs); err == nil {
+				messages = localMsgs
+			}
+		} else {
+			logError("agent transform failed: " + err.Error())
+		}
+	}
+
+	prompt := messagesToPrompt(messages)
+
+	// Friendly alias: chat.z.ai's UI label "GLM-5.3-Flash" is served by the
+	// backend model id "x-preview-l" (per /api/models display_name). Map the
+	// obvious client-facing name to the real id so pickers can offer the label.
+	if model == "glm-5.3-flash" {
+		model = "x-preview-l"
+	}
+
+	// Features are resolved per-model inside sendToZAI.
+	// Per-request overrides are only set if explicitly provided in the body.
+	opts := SendOptions{
+		Model:             model,
+		ChatID:            chatID,
+		ClientMessagesRaw: transformedMessages,
+		ReasoningEffort:   body.ReasoningEffort,
+		Files:             files,
+		RequestID:         requestId,
+		ToolsRaw:          body.Tools,
+	}
+
+	// Parse thinking configuration:
+	//   reasoning: true/false  ->  enable_thinking
+	//   "thinking": {"type":"enabled"|"disabled"}  ->  enable_thinking
+	if body.Reasoning != nil {
+		opts.Thinking = body.Reasoning
+	} else if len(body.Thinking) > 0 {
+		var thinkCfg struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(body.Thinking, &thinkCfg); err == nil {
+			enabled := thinkCfg.Type == "enabled"
+			opts.Thinking = &enabled
+		}
+	}
+
+	if body.WebSearch != nil {
+		opts.WebSearch = body.WebSearch
+	} else if body.Search != nil {
+		opts.WebSearch = body.Search
+	}
+	// Advanced Search (the MCP "advanced-search" server from chat.z.ai)
+	// rides on top of web search — turn the base toggle on with it, exactly
+	// like the web UI does (Advanced Search is only reachable when the
+	// globe/web-search mode is on). The agent-mode gate in sendToZAI still
+	// force-disables both when agent mode is active.
+	if body.AdvancedSearch != nil {
+		opts.AdvancedSearch = body.AdvancedSearch
+		if *body.AdvancedSearch && opts.WebSearch == nil {
+			on := true
+			opts.WebSearch = &on
+		}
+	}
+
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		flusher, _ := w.(http.Flusher)
+		var writeMu sync.Mutex
+
+		writeSSE := func(data string) {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		// Issue #45: the role/opening chunk must not carry a content key.
+		// An empty-string content delta tells OpenAI clients the answer
+		// has begun — when reasoning follows, clients see a blank content
+		// chunk interrupting the reasoning stream. A delta carrying only
+		// the role is the canonical opener.
+		writeSSE(toJSON(map[string]interface{}{
+			"id":      "chatcmpl-" + requestId,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"delta":         map[string]interface{}{"role": "assistant"},
+					"finish_reason": nil,
+				},
+			},
+		}))
+
+		fullContent := ""
+		fullReasoning := ""
+
+		var interceptor agentInterceptor
+		var ultraBuf *UltraBuffer
+		if config.AgentMode {
+			if UltraRepairEnabled() {
+				// §3: ultra buffers the stream for validator + ToolParserLLM repair
+				// instead of forwarding incrementally.
+				ultraBuf = NewUltraBuffer(body.Tools)
+			} else {
+				interceptor = newAgentInterceptor()
+			}
+		}
+		leakedFilter := newLeakedToolBlockFilter()
+		toolCallEmitted := false
+
+		emitToolCallDelta := func(tc map[string]interface{}) {
+			chunk := map[string]interface{}{
+				"id":      "chatcmpl-" + requestId,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"delta":         map[string]interface{}{"role": "assistant", "tool_calls": []map[string]interface{}{tc}},
+						"finish_reason": nil,
+					},
+				},
+			}
+			writeSSE(toJSON(chunk))
+		}
+
+		keepAliveStop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					// Issue #45: the keep-alive must be INERT. Emitting a
+					// delta that carries a content key (even an empty
+					// string) tells OpenAI clients the answer has begun,
+					// blank-splitting the reasoning accumulation whenever
+					// the 5s tick lands between two reasoning chunks. A
+					// delta with NO fields at all keeps proxies and clients
+					// from timing out without touching either channel.
+					writeSSE(toJSON(map[string]interface{}{
+						"id":      "chatcmpl-" + requestId,
+						"object":  "chat.completion.chunk",
+						"created": time.Now().Unix(),
+						"model":   model,
+						"choices": []map[string]interface{}{
+							{
+								"index":         0,
+								"delta":         map[string]interface{}{},
+								"finish_reason": nil,
+							},
+						},
+					}))
+				case <-keepAliveStop:
+					return
+				}
+			}
+		}()
+
+		errored := false
+		ch, err := sendToZAI(prompt, opts)
+		if err != nil {
+			log.Printf("[Stream] Error: %s", err.Error())
+			writeSSE(toJSON(formatOpenAIError(err.Error(), "api_error", statusFromError(err.Error()))))
+			writeSSE("[DONE]")
+			errored = true
+		} else {
+			for result := range ch {
+				if result.Err != nil {
+					log.Printf("[Stream] Error: %s", result.Err.Error())
+					writeSSE(toJSON(formatOpenAIError(result.Err.Error(), "api_error", statusFromError(result.Err.Error()))))
+					writeSSE("[DONE]")
+					errored = true
+					break
+				}
+
+				if result.Reasoning != "" {
+					fullReasoning += result.Reasoning
+					rChunk := map[string]interface{}{
+						"id":      "chatcmpl-" + requestId,
+						"object":  "chat.completion.chunk",
+						"created": time.Now().Unix(),
+						"model":   model,
+						"choices": []map[string]interface{}{
+							{
+								"index":         0,
+								"delta":         map[string]interface{}{"reasoning_content": result.Reasoning},
+								"finish_reason": nil,
+							},
+						},
+					}
+					writeSSE(toJSON(rChunk))
+					continue
+				}
+				if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {
+					// A deep edit_content rewrite rewound text that was
+					// already forwarded: the agent interceptor's view of
+					// the stream is stale, reset it (issue #23).
+					if interceptor != nil {
+						interceptor = rearmAgentInterceptor(interceptor)
+					}
+					if ultraBuf != nil {
+						ultraBuf.ResetTo(result.FullText)
+					}
+				}
+				if result.FullText != "" {
+					fullContent = result.FullText
+				} else {
+					fullContent += result.Chunk
+				}
+
+				// The parser emits the exact rune-safe delta to forward.
+				delta := result.Chunk
+				if delta == "" {
+					continue
+				}
+
+				if ultraBuf != nil {
+					// §3.1: buffer instead of streaming immediately; the
+					// validator + repair decision runs once at Finish.
+					ultraBuf.Feed(delta)
+					continue
+				}
+				if interceptor != nil {
+					contentDelta, toolCalls := interceptor.feed(delta)
+					contentDelta = leakedFilter.feed(contentDelta)
+					if contentDelta != "" {
+						c := formatOpenAIResponse(ResponseResult{Content: contentDelta}, model, requestId, true)
+						writeSSE(toJSON(c))
+					}
+					for _, tc := range toolCalls {
+						emitToolCallDelta(tc)
+						toolCallEmitted = true
+					}
+				} else {
+					delta = leakedFilter.feed(delta)
+					if delta != "" {
+						c := formatOpenAIResponse(ResponseResult{Content: delta}, model, requestId, true)
+						writeSSE(toJSON(c))
+					}
+				}
+			}
+		}
+
+		if !errored {
+			if ultraBuf != nil {
+				// §3.3–§3.4 + §4: validate the buffered text, repair
+				// malformed spans via ToolParserLLM, then replay through the stock
+				// interceptor so chunk ordering and the final terminator
+				// match the non-ultra path from here on.
+				content, toolCalls := ultraBuf.Finish()
+				content = stripLeakedToolBlocks(content)
+				if content != "" {
+					c := formatOpenAIResponse(ResponseResult{Content: content}, model, requestId, true)
+					writeSSE(toJSON(c))
+				}
+				for _, tc := range toolCalls {
+					emitToolCallDelta(tc)
+					toolCallEmitted = true
+				}
+				if toolCallEmitted {
+					finalChunk := map[string]interface{}{
+						"id":      "chatcmpl-" + requestId,
+						"object":  "chat.completion.chunk",
+						"created": time.Now().Unix(),
+						"model":   model,
+						"choices": []map[string]interface{}{
+							{
+								"index":         0,
+								"delta":         map[string]interface{}{},
+								"finish_reason": "tool_calls",
+							},
+						},
+					}
+					writeSSE(toJSON(finalChunk))
+				} else {
+					finalChunk := formatOpenAIResponse(ResponseResult{Content: "", FinishReason: "stop"}, model, requestId, true)
+					writeSSE(toJSON(finalChunk))
+				}
+			} else if interceptor != nil {
+				// Drain the interceptor tail: trailing text plus any
+				// tool call whose block only completed at end of stream
+				// (the modern shim holds back a window while streaming).
+				rem, tailCalls := interceptor.finish()
+				rem = leakedFilter.feed(rem) + leakedFilter.finish()
+				if rem != "" && !toolCallEmitted {
+					c := formatOpenAIResponse(ResponseResult{Content: rem}, model, requestId, true)
+					writeSSE(toJSON(c))
+				}
+				for _, tc := range tailCalls {
+					emitToolCallDelta(tc)
+					toolCallEmitted = true
+				}
+
+				if toolCallEmitted {
+					finalChunk := map[string]interface{}{
+						"id":      "chatcmpl-" + requestId,
+						"object":  "chat.completion.chunk",
+						"created": time.Now().Unix(),
+						"model":   model,
+						"choices": []map[string]interface{}{
+							{
+								"index":         0,
+								"delta":         map[string]interface{}{},
+								"finish_reason": "tool_calls",
+							},
+						},
+					}
+					writeSSE(toJSON(finalChunk))
+				} else {
+					finalChunk := formatOpenAIResponse(ResponseResult{Content: "", FinishReason: "stop"}, model, requestId, true)
+					writeSSE(toJSON(finalChunk))
+				}
+			} else {
+				if tail := leakedFilter.finish(); tail != "" {
+					c := formatOpenAIResponse(ResponseResult{Content: tail}, model, requestId, true)
+					writeSSE(toJSON(c))
+				}
+				finalChunk := formatOpenAIResponse(ResponseResult{Content: "", FinishReason: "stop"}, model, requestId, true)
+				writeSSE(toJSON(finalChunk))
+			}
+			writeSSE("[DONE]")
+		}
+
+		close(keepAliveStop)
+		wg.Wait()
+
+	} else {
+		ch, err := sendToZAI(prompt, opts)
+		if err != nil {
+			log.Printf("[API] Error: %s", err.Error())
+			writeJSON(w, statusFromError(err.Error()), formatOpenAIError(err.Error(), "api_error", nil))
+			return
+		}
+
+		fullContent := ""
+		fullReasoning := ""
+		for result := range ch {
+			if result.Err != nil {
+				log.Printf("[API] Error: %s", result.Err.Error())
+				writeJSON(w, statusFromError(result.Err.Error()), formatOpenAIError(result.Err.Error(), "api_error", nil))
+				return
+			}
+			if result.Reasoning != "" {
+				fullReasoning += result.Reasoning
+				continue
+			}
+			if result.FullText != "" {
+				fullContent = result.FullText
+			} else {
+				fullContent += result.Chunk
+			}
+		}
+
+		fullContent = stripLeakedToolBlocks(fullContent)
+
+		// Agent-mode: parse out tool-call blocks for non-stream response
+		if config.AgentMode {
+			if UltraRepairEnabled() {
+				// §4: repair malformed spans before parsing; valid canonical
+				// bypasses ToolParserLLM inside RepairUltraBuffer, plain text passes
+				// through byte-identical.
+				fullContent = UltraRepairFullText(fullContent, body.Tools)
+			}
+			toolCalls := agentExtractToolCalls(fullContent)
+			if len(toolCalls) > 0 {
+				stripped := agentStripToolCalls(fullContent)
+				writeJSON(w, 200, map[string]interface{}{
+					"id":      "chatcmpl-" + requestId,
+					"object":  "chat.completion",
+					"created": time.Now().Unix(),
+					"model":   model,
+					"choices": []map[string]interface{}{
+						{
+							"index": 0,
+							"message": func() map[string]interface{} {
+								m := map[string]interface{}{
+									"role":       "assistant",
+									"content":    stripped,
+									"tool_calls": toolCalls,
+								}
+								if fullReasoning != "" {
+									m["reasoning_content"] = fullReasoning
+								}
+								return m
+							}(),
+							"finish_reason": "tool_calls",
+						},
+					},
+					"usage": map[string]interface{}{
+						"prompt_tokens":     estimateTokens(prompt),
+						"completion_tokens": estimateTokens(fullContent),
+						"total_tokens":      estimateTokens(prompt) + estimateTokens(fullContent),
+					},
+				})
+				return
+			}
+		}
+
+		writeJSON(w, 200, formatOpenAIResponse(ResponseResult{Content: fullContent, Reasoning: fullReasoning}, model, requestId, false))
+	}
+}
+func featuresHandler(w http.ResponseWriter, r *http.Request) {
+	// ── GET: return resolved features for a model ──
+	if r.Method == "GET" {
+		model := r.URL.Query().Get("model")
+		if model != "" {
+			resolved := resolveFeaturesForModel(model)
+			state := getModelFeatureState(model)
+			caps := getModelCapabilities(model)
+			writeJSON(w, 200, map[string]interface{}{
+				"model":        model,
+				"features":     resolved,
+				"includeAll":   state.IncludeAll,
+				"overrides":    state.Overrides,
+				"capabilities": caps,
+			})
+			return
+		}
+		// No model specified — return all per-model states
+		modelFeatureStatesMu.Lock()
+		states := make(map[string]interface{})
+		for k, v := range modelFeatureStates {
+			states[k] = map[string]interface{}{
+				"includeAll": v.IncludeAll,
+				"overrides":  v.Overrides,
+			}
+		}
+		modelFeatureStatesMu.Unlock()
+		writeJSON(w, 200, map[string]interface{}{
+			"states": states,
+		})
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// ── POST: update per-model feature state ──
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, 400, map[string]interface{}{"error": "Failed to read body"})
+		return
+	}
+
+	// Parse as raw map to capture arbitrary capability keys
+	var body map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		writeJSON(w, 400, map[string]interface{}{"error": "Invalid JSON"})
+		return
+	}
+
+	model, _ := body["model"].(string)
+	if model == "" {
+		writeJSON(w, 400, map[string]interface{}{"error": "model is required"})
+		return
+	}
+
+	// Check Include-All-Features header
+	includeAllHeader := strings.EqualFold(r.Header.Get("Include-All-Features"), "true")
+
+	modelFeatureStatesMu.Lock()
+	state, ok := modelFeatureStates[model]
+	if !ok {
+		state = &ModelFeatureState{
+			IncludeAll: false,
+			Overrides:  make(map[string]interface{}),
+		}
+		modelFeatureStates[model] = state
+	}
+
+	// Set IncludeAll flag if header is present
+	if includeAllHeader {
+		state.IncludeAll = true
+	}
+
+	// Process user overrides — any key except "model" is treated as a feature override.
+	// Special handling: reasoning/thinking -> enable_thinking
+	for k, v := range body {
+		if k == "model" {
+			continue
+		}
+
+		// reasoning: true/false -> enable_thinking
+		if k == "reasoning" {
+			if b, ok := v.(bool); ok {
+				state.Overrides["enable_thinking"] = b
+			}
+			continue
+		}
+
+		// "thinking": {"type":"enabled"|"disabled"} or thinking: true/false -> enable_thinking
+		if k == "thinking" {
+			if b, ok := v.(bool); ok {
+				state.Overrides["enable_thinking"] = b
+				continue
+			}
+			if m, ok := v.(map[string]interface{}); ok {
+				if t, ok := m["type"].(string); ok {
+					state.Overrides["enable_thinking"] = (t == "enabled")
+				}
+				continue
+			}
+			continue
+		}
+
+		// All other keys: convert camelCase to snake_case (no alias mapping)
+		snakeKey := normalizeFeatureKey(k)
+		// image_generation overrides are ignored — always forced false
+		if snakeKey == "image_generation" {
+			continue
+		}
+		// 'think' is not accepted — use enable_thinking, reasoning, or thinking
+		if snakeKey == "think" {
+			continue
+		}
+		// reasoning_effort is a per-request parameter validated against model
+		// capabilities; it is NOT stored as a persistent override.
+		if snakeKey == "reasoning_effort" {
+			continue
+		}
+		state.Overrides[snakeKey] = v
+	}
+
+	// Resolve final features for response
+	caps := getModelCapabilities(model)
+	resolved := resolveFeaturesWithState(caps, state)
+	includeAll := state.IncludeAll
+	overrides := make(map[string]interface{})
+	for k, v := range state.Overrides {
+		overrides[k] = v
+	}
+	modelFeatureStatesMu.Unlock()
+
+	// Update session.Features for backward compat (dashboard display)
+	session.mu.Lock()
+	if v, ok := resolved["auto_web_search"].(bool); ok {
+		session.Features.WebSearch = v
+		session.Features.AutoWebSearch = v
+	}
+	if v, ok := resolved["enable_thinking"].(bool); ok {
+		session.Features.Thinking = v
+	}
+	if v, ok := resolved["preview_mode"].(bool); ok {
+		session.Features.PreviewMode = v
+	}
+	session.Features.ImageGen = false
+	session.mu.Unlock()
+
+	log.Printf("[Features] model=%s includeAll=%v overrides=%+v resolved=%+v",
+		model, includeAll, overrides, resolved)
+
+	writeJSON(w, 200, map[string]interface{}{
+		"success":    true,
+		"model":      model,
+		"includeAll": includeAll,
+		"overrides":  overrides,
+		"features":   resolved,
+	})
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	session.mu.Lock()
+	initialized := session.Initialized
+	session.mu.Unlock()
+
+	totalClients := 0
+	if initialized {
+		totalClients = 1
+	}
+
+	writeJSON(w, 200, map[string]interface{}{
+		"mode":         "direct",
+		"totalClients": totalClients,
+		"stats": map[string]interface{}{
+			"totalRequests": 0,
+		},
+	})
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	session.mu.Lock()
+	healthy := session.Initialized
+	session.mu.Unlock()
+
+	// Real-time device-token count from the active tokens.sqlite, served
+	// from a TTL cache (TOKEN_COUNT_TTL_MS, default 5 s) so a health probe
+	// never becomes a per-request DB query. -1 means "unavailable" — no
+	// database attached or the count query failed.
+	tokenCount := globalDBState.tokenCount()
+
+	status := 200
+	if !healthy {
+		status = 503
+	}
+	writeJSON(w, status, map[string]interface{}{
+		"healthy":    healthy,
+		"mode":       "direct",
+		"tokenCount": tokenCount,
+	})
+}
+
+// sqliteSwapHandler hot-swaps the active tokens.sqlite database.
+//
+//	POST /sqlite  {"db_path": "/new/path/to/tokens.sqlite"}
+//
+// The candidate file is validated (exists, readable, real SQLite, expected
+// `tokens` schema) before anything live is touched, then attached atomically.
+// In-flight requests keep their captured database handle and complete
+// normally; requests arriving mid-swap are briefly throttled, never denied.
+func sqliteSwapHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{
+			"success": false,
+			"error":   "method not allowed — use POST /sqlite with {\"db_path\": \"...\"}",
+		})
+		return
+	}
+
+	var body struct {
+		DBPath string `json:"db_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"error":   "invalid JSON body: " + err.Error(),
+		})
+		return
+	}
+	if body.DBPath == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"error":   "missing required field 'db_path'",
+		})
+		return
+	}
+
+	started := time.Now()
+	if err := swapDB(body.DBPath); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+			"db_path": body.DBPath,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":     true,
+		"message":     "database swapped",
+		"db_path":     body.DBPath,
+		"swapped_in":  fmt.Sprintf("%dms", time.Since(started).Milliseconds()),
+		"token_count": globalDBState.tokenCount(),
+	})
+}
+
+func clientsHandler(w http.ResponseWriter, r *http.Request) {
+	session.mu.Lock()
+	initialized := session.Initialized
+	session.mu.Unlock()
+
+	var clients []map[string]interface{}
+	if initialized {
+		clients = []map[string]interface{}{
+			{"id": "session", "status": "idle"},
+		}
+	} else {
+		clients = []map[string]interface{}{}
+	}
+	writeJSON(w, 200, map[string]interface{}{"clients": clients})
+}
+
+func injectHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"message":"Direct mode"}`))
+}
+
+func stopHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]interface{}{
+		"success": true,
+		"message": "Stop acknowledged",
+	})
+}

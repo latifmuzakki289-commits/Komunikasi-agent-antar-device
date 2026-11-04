@@ -1,0 +1,25 @@
+# Account/session secrets and local credentials
+.websession.json
+.zai-token
+.glm-auth-token
+.env
+.credentials.yaml
+**/.websession.json
+**/.zai-token*
+**/.glm-auth-token*
+
+# Runtime data, logs, local databases and generated binaries
+*.log
+*.pid
+*.sqlite
+*.sqlite-*
+/gateway.log
+/gateway.pid
+/glm-free-api/zai-api
+/glm-free-api/token-collector
+/glm-free-api/zai-bridge
+
+# Editor/runtime artifacts
+__pycache__/
+*.py[cod]
+.DS_Store
