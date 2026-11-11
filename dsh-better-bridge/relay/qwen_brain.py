@@ -101,6 +101,14 @@ BRIDGE_TIMEOUT = float(os.environ.get("QWEN_BRIDGE_TIMEOUT", "180"))
 WAF_COOLDOWN = float(os.environ.get("QWEN_WAF_COOLDOWN", "120"))
 BRIDGE_GRACE = float(os.environ.get("QWEN_BRIDGE_GRACE", "20"))
 
+# Fitur sisi-server Qwen. Default mati: agent punya tool sendiri, dan tool
+# bawaan Qwen (web_search, code_interpreter) membuat satu jawaban bisa makan
+# puluhan detik. QWEN_AUTO_SEARCH=1 membiarkan Qwen mencari web sendiri,
+# QWEN_THINKING=1 menyalakan mode berpikir (muncul sebagai reasoning_content).
+TRANSPORT = os.environ.get("QWEN_TRANSPORT", "direct").strip().lower()
+AUTO_SEARCH = os.environ.get("QWEN_AUTO_SEARCH", "0") == "1"
+THINKING = os.environ.get("QWEN_THINKING", "0") == "1"
+
 UA_FALLBACK = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) "
                "Gecko/20100101 Firefox/158.0")
 
@@ -336,45 +344,123 @@ def _token_candidates():
 _waf_until = 0.0
 
 
-def _sse_text(lines):
-    """Ambil teks jawaban dari stream SSE Qwen.
+def _preview(s, n=90):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[:n - 3] + "..."
 
-    Qwen mengirim delta per potongan, lalu satu entri terakhir yang membawa
-    choices[0].message.content berisi teks lengkap. Kalau keduanya dijumlah,
-    jawaban jadi dobel - jadi delta diutamakan dan teks lengkap hanya dipakai
-    saat tidak ada delta sama sekali.
+
+def _args_preview(args):
+    """Ringkas argumen tool (JSON, kadang belum lengkap) jadi satu baris."""
+    if not isinstance(args, str) or not args.strip():
+        return ""
+    try:
+        j = json.loads(args)
+    except ValueError:
+        return _preview(args)
+    if isinstance(j, dict):
+        for k in ("queries", "query", "code", "command", "url"):
+            if k in j:
+                v = j[k]
+                if isinstance(v, list):
+                    v = ", ".join(str(x) for x in v)
+                return _preview(v)
+    return _preview(args)
+
+
+def _result_preview(res):
+    if isinstance(res, dict) and isinstance(res.get("docs"), list):
+        return "%d hasil" % len(res["docs"])
+    if isinstance(res, str):
+        return _preview(res.replace("```", ""), 60)
+    return ""
+
+
+def _parse_sse_line(line, tools):
+    """Satu baris SSE Qwen -> daftar (kind, text).
+
+    kind:
+      think   proses berpikir (phase "think")
+      tool    status tool bawaan Qwen (web_search, code_interpreter, ...)
+      answer  isi jawaban (delta)
+      whole   teks lengkap penutup; hanya cadangan kalau tidak ada delta
+
+    tools: dict function_id -> {"name", "args"}, diisi selama stream supaya
+    status "selesai" bisa menyebut argumennya.
     """
-    deltas = []
-    whole = []
-    for line in lines:
-        if isinstance(line, bytes):
-            line = line.decode("utf-8", "replace")
-        s = line.strip()
-        if not s.startswith("data:"):
-            continue
-        p = s[5:].strip()
-        if not p or p == "[DONE]":
-            continue
-        try:
-            j = json.loads(p)
-        except ValueError:
-            continue
-        if not isinstance(j, dict):
-            continue
-        ch = (j.get("choices") or [{}])[0]
-        phase = str(ch.get("delta", {}).get("phase") or "")
-        if "think" in phase:
-            continue          # ringkasan proses berpikir, bukan jawaban
-        d = (ch.get("delta") or {}).get("content")
-        if isinstance(d, str) and d:
-            deltas.append(d)
-            continue
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    s = line.strip()
+    if not s.startswith("data:"):
+        return []
+    p = s[5:].strip()
+    if not p or p == "[DONE]":
+        return []
+    try:
+        j = json.loads(p)
+    except ValueError:
+        return []
+    if not isinstance(j, dict):
+        return []
+
+    ch = (j.get("choices") or [{}])[0]
+    d = ch.get("delta") or {}
+    phase = str(d.get("phase") or "")
+    status = str(d.get("status") or "")
+    content = d.get("content")
+
+    if "think" in phase:
+        return [("think", content)] if isinstance(content, str) and content else []
+
+    if phase in ("", "answer"):
+        if isinstance(content, str) and content:
+            return [("answer", content)]
+        if phase == "answer":
+            return []
         c = (ch.get("message") or {}).get("content")
         if c is None:
             c = j.get("response")
-        if isinstance(c, str) and c:
-            whole.append(c)
-    return "".join(deltas) if deltas else "".join(whole)
+        return [("whole", c)] if isinstance(c, str) and c else []
+
+    # phase tool: web_search, code_interpreter, dst.
+    ex = d.get("extra") if isinstance(d.get("extra"), dict) else {}
+    fid = str(d.get("function_id") or ex.get("function_id") or "")
+    fc = d.get("function_call")
+    if isinstance(fc, dict):
+        st = tools.get(fid)
+        if st is None:
+            name = str(fc.get("name") or phase)
+            tools[fid] = {"name": name, "args": fc.get("arguments") or ""}
+            return [("tool", "[%s] mulai" % name)]
+        if fc.get("arguments"):
+            st["args"] = fc["arguments"]
+        return []
+    if status == "finished":
+        st = tools.pop(fid, None) or {"name": str(d.get("name") or phase), "args": ""}
+        bits = [b for b in (_result_preview(ex.get("tool_result")),
+                            _args_preview(st["args"])) if b]
+        return [("tool", "[%s] selesai%s" % (st["name"], ": " + " | ".join(bits) if bits else ""))]
+    return []
+
+
+def _iter_events(lines):
+    """Generator (kind, text) dari baris-baris SSE; teks lengkap hanya cadangan."""
+    tools = {}
+    got_answer = False
+    whole = []
+    for line in lines:
+        for kind, text in _parse_sse_line(line, tools):
+            if kind == "whole":
+                whole.append(text)
+                continue
+            if kind == "answer":
+                got_answer = True
+            yield kind, text
+    if not got_answer and whole:
+        yield "answer", "".join(whole)
+
+
+def _sse_text(lines):
+    return "".join(t for k, t in _iter_events(lines) if k == "answer")
 
 
 def _direct_new_chat(model, token=None):
@@ -434,8 +520,13 @@ def _direct_new_chat(model, token=None):
     return ""
 
 
-def _direct(body, token=None):
-    """POST /api/v2/chat/completions with a browser TLS fingerprint."""
+def _direct_stream(body, token=None):
+    """POST /api/v2/chat/completions with a browser TLS fingerprint.
+
+    Generator of (kind, text): think / tool / answer. Auth and WAF errors are
+    raised before the first event, so a caller that has not received anything
+    yet can still fall back to another token or transport.
+    """
     global _waf_until
     if time.time() < _waf_until:
         raise WafBlocked("cooldown %.0fs (WAF sebelumnya)" % (_waf_until - time.time()))
@@ -480,30 +571,67 @@ def _direct(body, token=None):
         raise WafBlocked("tidak ada profil TLS yang dikenali curl_cffi: %s" % last_err)
 
     try:
-        lines = list(r.iter_lines())
+        if r.status_code in (401, 403):
+            raise QwenAuthFailed("HTTP %d: %s" % (r.status_code, r.content[:200]))
+        if r.status_code != 200:
+            _waf_until = time.time() + WAF_COOLDOWN
+            raise WafBlocked("HTTP %d: %s" % (r.status_code, r.content[:200]))
+
+        # Baris dibaca satu per satu supaya think/tool/answer bisa diteruskan
+        # begitu tiba. Baris non-"data:" (envelope error JSON, halaman WAF)
+        # dikumpulkan dan baru dinilai kalau stream tidak menghasilkan apa-apa.
+        tools = {}
+        other = []
+        other_size = 0
+        got_answer = False
+        whole = []
+        yielded = False
+        for line in r.iter_lines():
+            if isinstance(line, bytes):
+                raw_line = line
+            else:
+                raw_line = str(line).encode("utf-8", "replace")
+            if not raw_line.strip().startswith(b"data:"):
+                if other_size < 200000:
+                    other.append(raw_line)
+                    other_size += len(raw_line)
+                continue
+            for kind, text in _parse_sse_line(raw_line, tools):
+                if kind == "whole":
+                    whole.append(text)
+                    continue
+                if kind == "answer":
+                    got_answer = True
+                yielded = True
+                yield kind, text
+
+        if not got_answer and whole:
+            yield "answer", "".join(whole)
+            return
+        if got_answer:
+            return
+
+        blob = b"\n".join(other)
+        # Server kadang membalas HTTP 200 dengan envelope unauthorized, bukan 401.
+        if b'"unauthorized"' in blob or b"401 Unauthorized" in blob:
+            raise QwenAuthFailed("token ditolak: %s" % blob[:160])
+        if b"x5secdata" in blob or b"_____tmd_____" in blob or b"<html" in blob.lower():
+            _waf_until = time.time() + WAF_COOLDOWN
+            raise WafBlocked("respons challenge HTML (WAF) — cookie basi")
+        if not yielded:
+            raise WafBlocked("balasan kosong / format SSE tak dikenal: %s" % blob[:200])
     finally:
         try:
             r.close()
         except Exception:
             pass
 
-    if r.status_code == 401 or r.status_code == 403:
-        raise QwenAuthFailed("HTTP %d: %s" % (r.status_code, b"".join(lines)[:200]))
-    if r.status_code != 200:
-        _waf_until = time.time() + WAF_COOLDOWN
-        raise WafBlocked("HTTP %d: %s" % (r.status_code, b"".join(lines)[:200]))
 
-    blob = b"".join(lines)
-    # Server kadang membalas HTTP 200 dengan envelope unauthorized, bukan 401.
-    if b'"unauthorized"' in blob or b"401 Unauthorized" in blob:
-        raise QwenAuthFailed("token ditolak: %s" % blob[:160])
-    if b"x5secdata" in blob or b"_____tmd_____" in blob or b"<html" in blob.lower():
-        _waf_until = time.time() + WAF_COOLDOWN
-        raise WafBlocked("respons challenge HTML (WAF) — cookie basi")
-
-    text = _sse_text(lines)
+def _direct(body, token=None):
+    """Versi non-stream: kumpulkan seluruh jawaban jadi satu string."""
+    text = "".join(t for k, t in _direct_stream(body, token) if k == "answer")
     if not text:
-        raise WafBlocked("balasan kosong / format SSE tak dikenal: %s" % blob[:200])
+        raise WafBlocked("balasan kosong (tidak ada fase answer)")
     return text
 
 
@@ -574,6 +702,7 @@ class QwenBrain:
         # relay2's build_prompt() probes brain.session_id, an ApiBrain detail.
         # Keep the same attribute so the shared prompt builder works unchanged.
         self.session_id = None
+        self.transport = ""
 
     def new_chat(self):
         # UUID bertanda hubung, sama seperti yang dibuat app Qwen sendiri.
@@ -587,12 +716,7 @@ class QwenBrain:
             raise WafBlocked("bridge: %s" % str(res.get("error"))[:200])
         return res.get("text") or ""
 
-    def ask(self, text, model=None):
-        model = resolve_model(model)
-        if not self.chat_id:
-            self.new_chat()
-        load_session()
-
+    def _body(self, text, model):
         # Bentuk body disamakan dengan request asli app (tangkapan di panel).
         # Catatan: app TIDAK mengirim field "headers" di body, dan pesan
         # membawa files/extra/sub_chat_type/models serta feature_config lengkap.
@@ -623,51 +747,92 @@ class QwenBrain:
                 "model": "",
                 "chat_type": "t2t",
                 "feature_config": {
-                    "thinking_enabled": False,
+                    "thinking_enabled": THINKING,
                     "output_schema": "phase",
                     "research_mode": "normal",
                     "auto_thinking": False,
-                    "thinking_mode": "Fast",
-                    "auto_search": True,
+                    "thinking_mode": "Thinking" if THINKING else "Fast",
+                    "auto_search": AUTO_SEARCH,
                 },
                 "extra": {"meta": {"subChatType": "t2t"}},
                 "sub_chat_type": "t2t",
             }],
         }
+        return body
 
-        # Order matters. While a tab is polling the bridge, prefer it: those
-        # requests really come from the browser, so they cannot trip the WAF.
-        # Every direct attempt that gets challenged raises the risk score on the
-        # account, and a challenge is sticky — once triggered, the *next* bridge
-        # request gets challenged too, even though it is legitimate. So never
-        # poke the direct path while a working bridge exists.
-        order = ["bridge", "direct"] if BRIDGE.alive() else ["direct", "bridge"]
+    def _direct_events(self, text, model):
+        """Jalur direct: token dicoba berurutan, event diteruskan begitu tiba.
+
+        Token push browser dulu, token panjang /auths/ hanya cadangan. Token
+        yang ditolak sebelum event pertama dilewati; sesudah ada event yang
+        keluar, error dilempar apa adanya (fallback akan menggandakan output).
+        """
+        toks = _token_candidates()
+        if not toks:
+            raise QwenAuthFailed(
+                "session qwen kosong / kedaluwarsa — buka chat.qwen.ai dengan userscript aktif")
+        last = None
+        for tok in toks:
+            body = self._body(text, model)
+            started = False
+            try:
+                cid = _direct_new_chat(model, tok) or self.chat_id
+                body["chatId"] = cid
+                body["chat_id"] = cid
+                for ev in _direct_stream(body, tok):
+                    started = True
+                    yield ev
+                return
+            except QwenAuthFailed as e:
+                if started:
+                    raise
+                last = e
+                _log("qwen token %s... ditolak, coba berikutnya" % tok[:8])
+        raise last or QwenAuthFailed("semua token ditolak")
+
+    def ask_stream(self, text, model=None):
+        """Generator (kind, text): think / tool / answer.
+
+        Direct di-stream sungguhan. Bridge belum (userscript membalas sekali di
+        akhir), jadi hasilnya keluar sebagai satu event answer.
+        """
+        model = resolve_model(model)
+        if not self.chat_id:
+            self.new_chat()
+        load_session()
+
+        # Order matters. Only direct can stream think/tool/answer as they
+        # arrive; the bridge answers once at the end and drops think/tool. So
+        # direct goes first by default. A WAF challenge puts it on cooldown
+        # (QWEN_WAF_COOLDOWN) and the bridge takes over, which is the case the
+        # bridge exists for. QWEN_TRANSPORT=bridge restores bridge-first, the
+        # safer choice for the account when the cookies are known to be stale.
+        if TRANSPORT == "bridge" and BRIDGE.alive():
+            order = ["bridge", "direct"]
+        else:
+            order = ["direct", "bridge"]
 
         errors = []
         for how in order:
+            started = False
+            self.transport = how
             try:
                 if how == "bridge":
-                    return self._bridge(text, model)
-
-                # Token dicoba berurutan: token push browser dulu, token
-                # panjang /auths/ hanya cadangan. Token yang ditolak server
-                # (401) dilewati, bukan dipakai untuk semua percobaan.
-                toks = _token_candidates()
-                if not toks:
-                    raise QwenAuthFailed(
-                        "session qwen kosong / kedaluwarsa — buka chat.qwen.ai dengan userscript aktif")
-                last = None
-                for tok in toks:
-                    try:
-                        cid = _direct_new_chat(model, tok) or self.chat_id
-                        body["chatId"] = cid
-                        body["chat_id"] = cid
-                        return _direct(body, tok)
-                    except QwenAuthFailed as e:
-                        last = e
-                        _log("qwen token %s... ditolak, coba berikutnya" % tok[:8])
-                raise last or QwenAuthFailed("semua token ditolak")
+                    out = self._bridge(text, model)
+                    if out:
+                        yield "answer", out
+                    return
+                for ev in self._direct_events(text, model):
+                    started = True
+                    yield ev
+                return
             except (WafBlocked, QwenAuthFailed, BridgeAbsent, TimeoutError) as e:
+                if started:
+                    raise
                 errors.append("%s: %s" % (how, str(e)[:160]))
                 _log("qwen %s gagal: %s" % (how, str(e)[:160]))
         raise QwenAuthFailed("qwen tidak bisa dipakai - " + " | ".join(errors))
+
+    def ask(self, text, model=None):
+        """Non-stream: hanya isi jawaban; think dan status tool dibuang."""
+        return "".join(t for k, t in self.ask_stream(text, model) if k == "answer")

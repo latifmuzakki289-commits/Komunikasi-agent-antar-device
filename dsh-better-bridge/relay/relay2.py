@@ -824,6 +824,118 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _sse(self, obj):
+        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode())
+        self.wfile.flush()
+
+    def _qwen_stream(self, messages, tools, model):
+        """Qwen with stream=true: forward events as they arrive.
+
+        think and Qwen's own tool status go out as reasoning_content. The
+        answer is streamed as content only when the request carries no tools.
+        With tools, the answer is held back until the end, because a tool call
+        is only recognisable (parse_reply) once the whole reply is in; streaming
+        it raw would leak the call markup to the screen as plain text.
+        """
+        cid = "chatcmpl-chatbrain"
+        created = int(time.time())
+        hold = bool(tools)
+        started = False
+        answer = []
+        gen = None
+        counts = {"think": 0, "tool": 0, "answer": 0}
+
+        def chunk(delta, finish=None):
+            return {"id": cid, "object": "chat.completion.chunk", "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+        def begin():
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self._sse(chunk({"role": "assistant"}))
+
+        try:
+            with LOCK:
+                try:
+                    brain = get_brain("qwen-chat")
+                    prompt = build_prompt(messages, tools, brain, {"count": 0, "fp": ""})
+                    log("qwen prompt chars: %d (stream, hold_answer=%s)" % (len(prompt), hold))
+                    gen = brain.ask_stream(prompt, model=model)
+                    for kind, text in gen:
+                        if not started:
+                            begin()
+                            started = True
+                        counts[kind] = counts.get(kind, 0) + 1
+                        if kind == "answer":
+                            answer.append(text)
+                            if not hold:
+                                self._sse(chunk({"content": text}))
+                        else:
+                            rc = text if kind == "think" else "\n" + text + "\n"
+                            self._sse(chunk({"reasoning_content": rc}))
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    raise
+                except SessionExpired as e:
+                    log("session expired — waiting for a fresh push:", e)
+                    if started:
+                        self._sse(chunk({"content": "\n[session expired: %s]" % str(e)[:200]}, "stop"))
+                        self.wfile.write(b"data: [DONE]\n\n")
+                    else:
+                        self._json(401, {"error": {"message": str(e)[:300],
+                                                   "code": "session_expired"}})
+                    return
+                except Exception as e:
+                    log("ask failed:", repr(e)[:300])
+                    if started:
+                        self._sse(chunk({"content": "\n[qwen error: %s]" % str(e)[:200]}, "stop"))
+                        self.wfile.write(b"data: [DONE]\n\n")
+                    else:
+                        self._json(502, {"error": {"message": str(e)[:300],
+                                                   "code": "brain_failed"}})
+                    return
+
+            raw = "".join(answer)
+            log("qwen transport=%s events think=%d tool=%d answer=%d"
+                % (getattr(brain, "transport", "?"), counts["think"], counts["tool"], counts["answer"]))
+            log("reply chars:", len(raw))
+            try:
+                with open(REPLIES_LOG, "a", encoding="utf-8") as rf:
+                    rf.write("\n=== %s chain=qwen-chat ===\n%s\n" % (time.strftime("%H:%M:%S"), raw[:4000]))
+            except Exception:
+                pass
+            if not started:
+                begin()
+
+            finish = "stop"
+            if hold:
+                text, calls = parse_reply(raw)
+                if calls:
+                    calls = coerce_calls(calls, tools)
+                    text = trim_code_blocks(text)
+                    log("calls:", json.dumps(calls, ensure_ascii=False)[:800])
+                else:
+                    log("calls: none")
+                if text:
+                    self._sse(chunk({"content": text}))
+                if calls:
+                    finish = "tool_calls"
+                    self._sse(chunk({"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]}))
+            self._sse(chunk({}, finish))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            log("client menutup koneksi sebelum stream selesai")
+        finally:
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+
     def _ingest_session(self):
         """Receive a session push from the userscript (server binds 127.0.0.1
         only, so this is reachable from this machine alone).
@@ -904,6 +1016,9 @@ class H(BaseHTTPRequestHandler):
         log("completion req: msgs=%d tools=%d stream=%s model=%s"
             % (len(messages), len(tools), stream, model))
         use_qwen = bool(qw) and model.lower().startswith("qwen")
+        if use_qwen and stream:
+            self._qwen_stream(messages, tools, model)
+            return
         with LOCK:
             try:
                 # build_prompt() may call brain.new_chat(), which authenticates

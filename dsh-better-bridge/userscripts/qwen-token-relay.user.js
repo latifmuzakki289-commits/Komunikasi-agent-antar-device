@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Qwen Chat Token -> relay (auto-sync + bridge + template)
 // @namespace    dsh-go
-// @version      1.6.0
+// @version      1.6.2
 // @description  Push token + cookies chat.qwen.ai ke relay2.py, jadi jembatan eksekusi dari dalam tab, dan memakai bentuk request yang sama dengan app Qwen.
 // @match        https://chat.qwen.ai/*
 // @match        https://chat.qwenlm.ai/*
@@ -192,11 +192,16 @@
     }
   }
 
-  const snapshot = () => {
+  function bestToken() {
     let f = findToken();
     if (refreshed && (!f || refreshed.exp > f.exp)) {
       f = { token: refreshed.token, key: 'auth-refresh', exp: refreshed.exp };
     }
+    return f;
+  }
+
+  const snapshot = () => {
+    const f = bestToken();
     return {
       provider: PROVIDER,
       token: f ? f.token : '',
@@ -385,7 +390,7 @@
           research_mode: 'normal',
           auto_thinking: false,
           thinking_mode: 'Fast',
-          auto_search: true,
+          auto_search: false,
         },
         extra: { meta: { subChatType: CHAT_TYPE } },
         sub_chat_type: CHAT_TYPE,
@@ -431,6 +436,14 @@
         body.messages[0].sub_chat_type = tm.sub_chat_type;
       }
     }
+    // Template datang dari chat manual (auto_search: true). Untuk agent, tool
+    // bawaan Qwen (web_search, code_interpreter) hanya memperlambat, dan
+    // bridge membalas sekali di akhir sehingga proses berpikir terbuang.
+    const fc = body.messages[0].feature_config;
+    fc.auto_search = false;
+    fc.thinking_enabled = false;
+    fc.auto_thinking = false;
+    fc.thinking_mode = 'Fast';
     return body;
   }
 
@@ -591,7 +604,11 @@
     }
 
     async function sendChat(prompt, model) {
-      const f = findToken();
+      let f = bestToken();
+      if (f && f.exp - Date.now() / 1000 < 60) {
+        await refreshViaAuth();
+        f = bestToken();
+      }
       if (!f) throw new Error('token hilang dari storage');
 
       const t = loadTemplate();
@@ -772,7 +789,7 @@
     const hb = setInterval(() => push('heartbeat'), HEARTBEAT);
     // 2. deteksi rotasi token
     const tk = setInterval(() => {
-      const f = findToken();
+      const f = bestToken();
       if (f && f.token !== lastPushed) push('token berubah');
     }, TICK);
     // 3. tab aktif lagi
