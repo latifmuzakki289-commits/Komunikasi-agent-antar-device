@@ -34,7 +34,9 @@ curl http://127.0.0.1:20232/v1/chat/completions -H "Content-Type: application/js
 - direct : relay memanggil Qwen sendiri via `curl_cffi` + cookie WAF dari tab. Cepat, tidak perlu tab terbuka saat request, tapi butuh token push yang masih hidup.
 - bridge : relay menaruh job di antrean, userscript di tab mengambil lalu `fetch` dari dalam halaman. Kebal fingerprint, tapi butuh tab terbuka.
 
-Bridge dicoba lebih dulu kalau ada tab yang polling. Direct jadi cadangan.
+Direct dicoba lebih dulu karena hanya direct yang bisa streaming (think, tool,
+answer). Bridge jadi cadangan saat direct gagal atau kena WAF. Set
+`QWEN_TRANSPORT=bridge` untuk urutan sebaliknya.
 
 ## Pelajaran penting (urut dari yang paling mahal)
 
