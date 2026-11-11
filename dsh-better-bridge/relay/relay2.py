@@ -6,12 +6,19 @@ deepseek-pow solver for the PoW challenge header. Renders the harness's
 system+tools as a text tag contract and parses tagged/DSML replies back into
 OpenAI tool_calls.
 
+Session freshness: DeepSeek rotates userToken every few hours to days, so the
+session file is re-read whenever its mtime changes (no restart needed) and can
+be refreshed live via POST /session — see deepseek-token-sync.user.js. Auth
+rejections (HTTP 200 + code 40003, or 401/403) raise SessionExpired and are
+NEVER retried; the handler answers 401 session_expired and idles until the next
+push, because repeated auth failures accelerate an account ban.
+
 Sanitized for publication: filesystem paths and the port are configurable via
 environment variables (see .env.example); no credentials are stored in this
 file. The session token lives in a separate JSON file (default
 ./.websession.json next to this script) — keep it chmod 600 and never commit
 it."""
-import json, time, hashlib, threading, re, os, base64
+import json, time, hashlib, threading, re, os, base64, socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request, urllib.error
 from deepseek_pow import Challenge, registry
@@ -22,34 +29,128 @@ BASE = "https://chat.deepseek.com"
 SESSION_FILE = os.environ.get("CHATBRAIN_SESSION_FILE", os.path.join(HERE, ".websession.json"))
 LOG_FILE = os.environ.get("CHATBRAIN_LOG_FILE", os.path.join(HERE, "relay2.log"))
 REPLIES_LOG = os.environ.get("CHATBRAIN_REPLIES_LOG", os.path.join(HERE, "relay2-replies.log"))
-WS = json.load(open(SESSION_FILE))
-TOKEN = WS["token"]
-_raw_cookies = WS.get("cookies") or {}
-if isinstance(_raw_cookies, list):
-    COOKIES = {c["name"]: c["value"] for c in _raw_cookies if "name" in c}
-else:
-    COOKIES = _raw_cookies
-UA = "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0"
 LOG = open(LOG_FILE, "a", buffering=1)
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, file=LOG)
 
+# Fallback fingerprint, used only when SESSION_FILE predates auto-sync and
+# carries no "ua"/"lang" of its own. Windows, matching the machine this runs on
+# (the old Linux UA was a fingerprint mismatch against the real browser).
+UA_FALLBACK = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) "
+               "Gecko/20100101 Firefox/158.0")
+AUTH_CODES = {40003}          # DeepSeek "Authorization Failed"
+
+class SessionExpired(RuntimeError):
+    """Token refused upstream. Not retryable — wait for a fresh browser push."""
+
+# Live session state. Re-read from SESSION_FILE whenever its mtime changes, so a
+# userToken rotated by the browser is picked up without restarting the relay.
+S = {"mtime": None, "token": None, "cookie_list": [], "cookies": {},
+     "ua": UA_FALLBACK, "lang": "en-US"}
+
+def _cookie_list(raw):
+    """Normalize the file's cookies field into a list of {name,value,...}."""
+    if isinstance(raw, list):
+        return [c for c in raw if isinstance(c, dict) and "name" in c]
+    if isinstance(raw, dict):
+        return [{"name": k, "value": v, "domain": ".deepseek.com"}
+                for k, v in raw.items()]
+    return []
+
+def _merge_cookies(old, new):
+    """Pushed cookies win, but cookies the push cannot see are kept.
+
+    The userscript reads document.cookie, which never exposes HttpOnly cookies
+    (e.g. ds_session_id) — so replacing the whole set would silently drop them.
+    """
+    by_name = {}
+    for c in old or []:
+        by_name[c["name"]] = c
+    for c in new or []:
+        by_name[c["name"]] = c
+    return list(by_name.values())
+
+def _norm_token(raw):
+    """localStorage keeps userToken as {"value": "...", "__version": "0"}.
+    Unwrap it; return "" when there is no usable token (logged-out tab)."""
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip()
+    if s.startswith("{"):
+        try:
+            j = json.loads(s)
+        except ValueError:
+            return ""
+        v = j.get("value") if isinstance(j, dict) else None
+        return v.strip() if isinstance(v, str) else ""
+    return s
+
+def load_session(force=False):
+    """Reload SESSION_FILE if it changed on disk. One stat() per call."""
+    try:
+        mtime = os.stat(SESSION_FILE).st_mtime
+    except OSError:
+        if force:
+            log("session file missing:", SESSION_FILE)
+        return
+    if not force and mtime == S["mtime"]:
+        return
+    try:
+        with open(SESSION_FILE) as f:
+            ws = json.load(f)
+    except (ValueError, OSError) as e:
+        log("session file unreadable (kept previous):", e)
+        return
+    tok = _norm_token(ws.get("token"))
+    if not tok:
+        S["mtime"] = mtime
+        log("session file has no usable token (kept previous)")
+        return
+    clist = _cookie_list(ws.get("cookies"))
+    if tok != S["token"]:
+        log("session loaded: token %s...%s source=%s cookies=%d ua=%s"
+            % (tok[:4], tok[-4:], "browser" if ws.get("ua") else "extractor",
+               len(clist), "browser" if ws.get("ua") else "fallback"))
+    S.update(mtime=mtime, token=tok, cookie_list=clist,
+             cookies={c["name"]: c["value"] for c in clist},
+             ua=ws.get("ua") or UA_FALLBACK,
+             lang=ws.get("lang") or "en-US")
+
+load_session(force=True)
+
+# Qwen is optional: the module imports fine without curl_cffi (the bridge
+# transport needs no TLS impersonation), so only a broken install disables it.
+try:
+    import qwen_brain as qw
+    qw.set_logger(log)
+    log("qwen brain enabled: session=%s impersonate=%s model=%s"
+        % (qw.SESSION_FILE, qw.IMPERSONATE, qw.MODEL_DEFAULT))
+except Exception as _e:
+    qw = None
+    log("qwen brain disabled:", repr(_e)[:200])
+
 SOLVER = registry.get("DeepSeekHashV1")
 
 def api(method, path, body=None, extra_headers=None):
+    load_session()               # pick up a token rotated upstream
+    if not S["token"]:
+        raise SessionExpired(
+            "session file belum berisi token — jalankan extract.py "
+            "atau push dari userscript")
     url = BASE + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", "Bearer " + TOKEN)
-    req.add_header("User-Agent", UA)
+    req.add_header("Authorization", "Bearer " + S["token"])
+    req.add_header("User-Agent", S["ua"])
     req.add_header("Origin", BASE)
     req.add_header("Referer", BASE + "/")
     req.add_header("Accept", "*/*")
+    req.add_header("Accept-Language", S["lang"])
     if data:
         req.add_header("Content-Type", "application/json")
-    if COOKIES:
-        req.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in COOKIES.items()))
+    if S["cookies"]:
+        req.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in S["cookies"].items()))
     for k, v in (extra_headers or {}).items():
         req.add_header(k, v)
     try:
@@ -58,8 +159,46 @@ def api(method, path, body=None, extra_headers=None):
     except urllib.error.HTTPError as e:
         return e.code, e.read()
 
+def classify(st, raw):
+    """Bucket an upstream reply: 'ok' | 'auth' | 'rate' | 'other'.
+
+    DeepSeek reports auth failure as HTTP 200 + code 40003 (not 401), so the
+    body is inspected even on a 200. 'auth' must NEVER be retried — repeated
+    auth failures on a consumer account read as credential probing and
+    accelerate a ban.
+    """
+    if st in (401, 403):
+        return "auth"
+    if st == 429:
+        return "rate"
+    try:
+        if json.loads(raw).get("code") in AUTH_CODES:
+            return "auth"
+    except Exception:
+        pass
+    return "ok" if st == 200 else "other"
+
+def _check(st, raw, what):
+    """Raise a classified error for a failed upstream reply.
+
+    Deliberately does NOT short-circuit on st == 200: the 40003 case arrives
+    with HTTP 200, so the body has to be classified first.
+    """
+    kind = classify(st, raw)
+    if kind == "ok":
+        return
+    if kind == "auth":
+        raise SessionExpired(
+            "token ditolak saat %s (HTTP %s / code 40003) — "
+            "menunggu push baru dari browser" % (what, st))
+    if kind == "rate":
+        raise RuntimeError("rate limited saat %s — jeda dulu, jangan ditekan ulang"
+                           % what)
+    raise RuntimeError("%s HTTP %s: %s" % (what, st, raw[:300]))
+
 def solve_pow():
     st, raw = api("POST", "/api/v0/chat/create_pow_challenge", {"target_path": "/api/v0/chat/completion"})
+    _check(st, raw, "pow challenge")
     j = json.loads(raw)
     ch = j["data"]["biz_data"]["challenge"]
     log("pow challenge: algo=%s diff=%s" % (ch.get("algorithm"), ch.get("difficulty")))
@@ -86,6 +225,7 @@ class ApiBrain:
 
     def new_chat(self):
         st, raw = api("POST", "/api/v0/chat_session/create", {})
+        _check(st, raw, "create chat session")
         j = json.loads(raw)
         sid = j["data"]["biz_data"]["chat_session"]["id"]
         self.session_id = sid
@@ -94,10 +234,12 @@ class ApiBrain:
 
     def _final_text(self):
         st, raw = api("GET", "/api/v0/chat/history_messages?chat_session_id=" + self.session_id)
+        _check(st, raw, "history fetch")
         j = json.loads(raw)
         msgs = j["data"]["biz_data"]["chat_messages"]
         assistants = [m for m in msgs if m.get("role") == "ASSISTANT"]
         if not assistants:
+            log("history tanpa pesan ASSISTANT:", raw[:300])
             return "", None
         m = assistants[-1]
         text = "".join(f.get("content", "") for f in m.get("fragments", []) if f.get("type") == "RESPONSE")
@@ -116,13 +258,14 @@ class ApiBrain:
             "search_enabled": False,
         }
         st, raw = api("POST", "/api/v0/chat/completion", body, {"x-ds-pow-response": pow_header})
-        if st != 200:
-            raise RuntimeError("completion HTTP %s: %s" % (st, raw[:300]))
+        _check(st, raw, "completion")
         # raw is the consumed SSE stream; authoritative text comes from history
         txt, mid = self._final_text()
         if mid is not None:
             self.parent_id = mid
         log("ask done: answer chars=%d parent=%s" % (len(txt), mid))
+        if not txt:
+            log("completion tanpa jawaban: HTTP %s head=%r tail=%r" % (st, raw[:300], raw[-300:]))
         return txt
 
 LOCK = threading.Lock()
@@ -144,7 +287,7 @@ def chain_key(messages, tools):
 
 def get_brain(key):
     if key not in BRAINS:
-        BRAINS[key] = ApiBrain()
+        BRAINS[key] = qw.QwenBrain() if (qw and key.startswith("qwen")) else ApiBrain()
         CHAINS[key] = {"count": 0, "fp": ""}
         if len(BRAINS) > 6:
             old = next(iter(BRAINS))
@@ -185,6 +328,7 @@ RULES:
 The arguments MUST be nested inside "arguments" — never put them at the top level next to "name". Example:
 <tool_call>{"name": "bash", "arguments": {"command": "ls -la /tmp"}}</tool_call>
 You may emit several <tool_call> blocks in a row. Use the exact tool names and JSON arguments matching each tool's params schema.
+1b. NEVER wrap calls in DSML tags ("<｜｜DSML｜｜...>"): that markup belongs to another client and the harness will reject it. Only the <tool_call> JSON above. Match the schema types EXACTLY — numbers as JSON numbers (20000, not "20000"), booleans as true/false (not "true"), objects/arrays as real JSON, never as stringified JSON.
 2. After tool calls, the harness will reply with messages starting "Tool result (name):" containing the outputs. Read them and continue: call more tools or finish.
 3. When the task is complete or no tool is needed, reply with a plain final answer (no tool_call blocks).
 4. FINAL ANSWER FORMAT: write like a chat message a human reads on a phone — short paragraphs or tight bullet points, in the user's language. NEVER wrap a report, summary, environment scan, findings list, or status rundown in a code block; a wall of monospaced text is unreadable and looks like a script dump. Code blocks are ONLY for literal code you wrote into a file via a tool, or a short raw excerpt of tool output (max ~15 lines) when the exact bytes matter. NEVER paste a script or command you ran into your visible text at any point — the harness already displays your tool calls; your text is for narration and conclusions only.
@@ -241,7 +385,7 @@ def build_prompt(messages, tools, brain, chain):
     if tools:
         # recency anchor on the agent chain only: the chat brain drifts into
         # "helpful chatbot" mode and hands the user scripts to run manually
-        text += "\n\n[Reminder: you have tools. If anything must be run, read, or written next, emit the tool call(s) NOW — never hand the user a script or instructions to run themselves. Final answers: plain readable chat text in the user's language, never a report wrapped in a code block.]"
+        text += "\n\n[Reminder: you have tools. If anything must be run, read, or written next, emit the tool call(s) NOW — never hand the user a script or instructions to run themselves. Tool calls use <tool_call>{\"name\":...,\"arguments\":{...}}</tool_call> ONLY (no DSML tags), with schema-correct JSON types (timeout: 20000, not \"20000\"; background: false, not \"false\"). Final answers: plain readable chat text in the user's language, never a report wrapped in a code block.]"
     chain["count"] = n
     chain["fp"] = fp_of(messages[-1]) if messages else ""
     return text
@@ -267,6 +411,45 @@ INVOKE_CLOSE_RE = re.compile(r"</｜｜DSML｜｜\s*invoke\s*>", re.S)
 PARAM_CLOSE_RE = re.compile(r"</｜｜DSML｜｜\s*parameter[^>]*>", re.S)
 CALLS_CLOSE_RE = re.compile(r"</?｜｜DSML｜｜\s*(tool_)?calls\s*>", re.S)
 CALLS_OPEN_RE = re.compile(r"<｜｜DSML｜｜\s*calls\s*>", re.S)
+
+# `\uff5c` = fullwidth vertical line, `\ufffd` = replacement char the web API
+# leaves when a pipe byte is mangled in its stored text.
+DSML_TAG_RE = re.compile(r"</?\s*[\uff5c\ufffd|/]+\s*DSML\s*[\uff5c\ufffd|/]+[^>]*>")
+DSML_DANGLING_RE = re.compile(r"</?\s*[\uff5c\ufffd|/]+\s*DSML[^\n>]*$")
+DSML_MARK_RE = re.compile(r"</?[\uff5c|/]{1,4}\s*DSML\s*[\uff5c|/]{1,4}>?")
+
+def _strip_dsml_markup(s):
+    """Remove DSML tags/markers that leaked into a parameter VALUE.
+
+    The web model often closes a parameter with a bare `</｜｜DSML｜｜>` (no
+    `parameter` keyword), so PARAM_CLOSE_RE never sees it and the tag ends up
+    inside the value:
+
+        "timeout": "20000</｜｜DSML｜｜>\\n</｜｜DSML｜｜>"
+
+    which the harness rejects with `timeout: Expected number`. Strip the
+    markup so the remaining text ("20000") can be JSON-decoded normally.
+
+    Strings without the literal marker are returned untouched, so file
+    content passed to a write/edit tool keeps its exact leading/trailing
+    whitespace.
+    """
+    if not s or "DSML" not in s:
+        return s
+    s = DSML_TAG_RE.sub("", s)
+    s = DSML_DANGLING_RE.sub("", s)
+    s = DSML_MARK_RE.sub("", s)
+    return s.strip()
+
+def _clean_obj(v):
+    """Recursively strip DSML debris from every string inside parsed args."""
+    if isinstance(v, str):
+        return _strip_dsml_markup(v)
+    if isinstance(v, list):
+        return [_clean_obj(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _clean_obj(x) for k, x in v.items()}
+    return v
 
 def _parse_params(span):
     """Parse parameter openers inside one invoke span.
@@ -295,7 +478,9 @@ def _parse_params(span):
                 cands.append(m.start())
         seg = span[seg_start:min(cands)].strip()
         # strip a fused closer that got included at the tail
-        seg = PARAM_CLOSE_RE.split(seg)[0].strip()
+        seg = PARAM_CLOSE_RE.split(seg)[0]
+        # ...and any bare/broken DSML tag left inside the value itself
+        seg = _strip_dsml_markup(seg)
         if is_str == "true":
             args[key] = seg
         else:
@@ -308,6 +493,7 @@ def _parse_params(span):
 def _make_call(name, args, seed):
     if set(args.keys()) == {"arguments"} and isinstance(args["arguments"], dict):
         args = args["arguments"]
+    args = _clean_obj(args)
     return {
         "id": "call_" + hashlib.md5(seed.encode()).hexdigest()[:10],
         "type": "function",
@@ -470,6 +656,93 @@ def trim_code_blocks(text):
                 "\n… (trimmed — the full version ran as a tool call)\n```")
     return FENCE_RE.sub(repl, text)
 
+def _tool_props(tools):
+    """name -> {param: schema} map from the request's OpenAI tools array."""
+    props = {}
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        params = fn.get("parameters")
+        p = params.get("properties") if isinstance(params, dict) else None
+        if name and isinstance(p, dict):
+            props[name] = p
+    return props
+
+def _coerce_value(v, spec):
+    """Coerce one argument value to the type the tool schema declares.
+
+    The chat model tends to send numbers/booleans as strings ("20000",
+    "true") — sometimes with trailing whitespace. Harnesses validate
+    strictly (`timeout: Expected number`), so type the value here instead
+    of letting the call bounce.
+    """
+    if not isinstance(spec, dict):
+        return v
+    t = spec.get("type")
+    if isinstance(t, list):  # e.g. ["integer", "null"]
+        t = next((x for x in t if x != "null"), None)
+    if t == "string":
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
+        return v
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if t == "integer":
+        try:
+            return int(s)
+        except ValueError:
+            try:
+                f = float(s)
+            except ValueError:
+                return v
+            return int(f) if f.is_integer() else f
+    if t == "number":
+        try:
+            f = float(s)
+        except ValueError:
+            return v
+        return int(f) if f.is_integer() else f
+    if t == "boolean":
+        low = s.lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+        return v
+    if t in ("object", "array"):
+        try:
+            got = json.loads(s)
+        except ValueError:
+            return v
+        ok = isinstance(got, dict) if t == "object" else isinstance(got, list)
+        return got if ok else v
+    return v
+
+def coerce_calls(calls, tools):
+    """Apply the tool schemas to every parsed call's arguments."""
+    props = _tool_props(tools)
+    if not props:
+        return calls
+    for c in calls:
+        fn = c.get("function") or {}
+        spec = props.get(fn.get("name"))
+        if not spec:
+            continue
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            continue
+        if not isinstance(args, dict):
+            continue
+        fixed = {k: _coerce_value(v, spec.get(k) or {}) for k, v in args.items()}
+        fn["arguments"] = json.dumps(fixed, ensure_ascii=False)
+    return calls
+
 def parse_reply(raw):
     raw = normalize_dsml(raw)
     calls = []
@@ -545,13 +818,81 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _empty(self, code):
+        """204-style reply: no body, no Content-Type."""
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _ingest_session(self):
+        """Receive a session push from the userscript (server binds 127.0.0.1
+        only, so this is reachable from this machine alone).
+
+        Written via tmp + os.replace so a concurrent api() read never sees a
+        half-written file.
+        """
+        ln = int(self.headers.get("Content-Length") or 0)
+        try:
+            ws = json.loads(self.rfile.read(ln) or b"{}")
+        except ValueError:
+            self._json(400, {"error": "invalid json"}); return
+        # Provider dispatch: /session is shared with the qwen userscript. Without
+        # this branch a qwen push would overwrite the deepseek session file (and
+        # vice versa) — they are separate accounts with separate tokens.
+        if qw and ws.get("provider") == "qwen":
+            code, obj = qw.ingest(ws)
+            log("qwen session push:", json.dumps(obj)[:220])
+            self._json(code, obj); return
+        tok = _norm_token(ws.get("token"))
+        if not tok:
+            log("session push ditolak: token kosong (tab belum login?), sesi lama dipertahankan")
+            self._json(400, {"error": "missing token"}); return
+        ws["token"] = tok
+        # Merge rather than replace: document.cookie cannot see HttpOnly
+        # cookies, so a push may carry fewer cookies than the file already has.
+        ws["cookies"] = _merge_cookies(S["cookie_list"], _cookie_list(ws.get("cookies")))
+        tmp = SESSION_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(ws, f)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass                    # not meaningful on Windows, harmless
+        os.replace(tmp, SESSION_FILE)
+        load_session(force=True)
+        log("session pushed: token %s...%s ua=%s cookies=%d"
+            % (ws["token"][:4], ws["token"][-4:],
+               "browser" if ws.get("ua") else "missing", len(S["cookie_list"])))
+        self._json(200, {"ok": True, "cookies": len(S["cookie_list"])})
+
     def do_GET(self):
         if self.path.startswith("/v1/models"):
-            self._json(200, {"object": "list", "data": [{"id": "deepseek-chat", "object": "model", "owned_by": "chatbrain"}]})
+            data = [{"id": "deepseek-chat", "object": "model", "owned_by": "chatbrain"}]
+            if qw:
+                data.append({"id": "qwen-chat", "object": "model", "owned_by": "chatbrain"})
+            self._json(200, {"object": "list", "data": data})
+        elif qw and self.path.startswith("/qwen/bridge/pull"):
+            job = qw.BRIDGE.pull()
+            if job is None:
+                self._empty(204)
+            else:
+                self._json(200, job)
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/session":
+            self._ingest_session(); return
+        if qw and self.path.startswith("/qwen/bridge/push"):
+            ln = int(self.headers.get("Content-Length") or 0)
+            try:
+                d = json.loads(self.rfile.read(ln) or b"{}")
+            except ValueError:
+                self._json(400, {"error": "invalid json"}); return
+            ok = qw.BRIDGE.push(d)
+            if not ok:
+                log("qwen bridge push untuk job tak dikenal:", str(d.get("id"))[:12])
+            self._json(200, {"ok": ok}); return
         if not self.path.startswith("/v1/chat/completions"):
             self._json(404, {"error": "not found"}); return
         ln = int(self.headers.get("Content-Length") or 0)
@@ -559,34 +900,62 @@ class H(BaseHTTPRequestHandler):
         messages = req.get("messages") or []
         tools = req.get("tools") or []
         stream = bool(req.get("stream"))
-        log("completion req: msgs=%d tools=%d stream=%s" % (len(messages), len(tools), stream))
+        model = (req.get("model") or "deepseek-chat").strip()
+        log("completion req: msgs=%d tools=%d stream=%s model=%s"
+            % (len(messages), len(tools), stream, model))
+        use_qwen = bool(qw) and model.lower().startswith("qwen")
         with LOCK:
-            key = chain_key(messages, tools)
-            brain = get_brain(key)
-            chain = CHAINS[key]
-            prompt = build_prompt(messages, tools, brain, chain)
-            log("prompt chars: %d chain=%s" % (len(prompt), key))
             try:
-                raw = brain.ask(prompt)
+                # build_prompt() may call brain.new_chat(), which authenticates
+                # too — it must sit inside this try or a SessionExpired there
+                # escapes as an unhandled 500 instead of a clean 401.
+                if use_qwen:
+                    # Qwen keeps no parent_message chain we can rely on, so the
+                    # full rendered prompt is resent every turn: chain state is
+                    # passed as a throwaway dict and can never desync from the
+                    # harness's view of history. Token cost is not metered on
+                    # the web tier, so this is the cheap, correct trade.
+                    key = "qwen-chat"
+                    brain = get_brain(key)
+                    prompt = build_prompt(messages, tools, brain, {"count": 0, "fp": ""})
+                    log("qwen prompt chars: %d" % len(prompt))
+                    raw = brain.ask(prompt, model=model)
+                else:
+                    key = chain_key(messages, tools)
+                    brain = get_brain(key)
+                    chain = CHAINS[key]
+                    prompt = build_prompt(messages, tools, brain, chain)
+                    log("prompt chars: %d chain=%s" % (len(prompt), key))
+                    raw = brain.ask(prompt)
+            except SessionExpired as e:
+                # Idle until the userscript pushes a fresh token. Retrying here
+                # would only deepen the risk score on the account.
+                log("session expired — waiting for a fresh push:", e)
+                self._json(401, {"error": {"message": str(e)[:300],
+                                           "code": "session_expired"}}); return
             except Exception as e:
                 log("ask failed:", repr(e)[:300])
                 self._json(502, {"error": {"message": str(e)[:300], "code": "brain_failed"}}); return
         log("reply chars:", len(raw))
         try:
-            with open(REPLIES_LOG, "a") as rf:
+            with open(REPLIES_LOG, "a", encoding="utf-8") as rf:
                 rf.write("\n=== %s chain=%s ===\n%s\n" % (time.strftime("%H:%M:%S"), key, raw[:4000]))
         except Exception:
             pass
         text, calls = parse_reply(raw)
         if calls:
+            calls = coerce_calls(calls, tools)
             text = trim_code_blocks(text)
+            log("calls:", json.dumps(calls, ensure_ascii=False)[:800])
+        else:
+            log("calls: none")
         finish = "tool_calls" if calls else "stop"
         msg = {"role": "assistant", "content": text if text else None}
         if calls:
             msg["tool_calls"] = calls
         comp = {
             "id": "chatcmpl-chatbrain", "object": "chat.completion", "created": int(time.time()),
-            "model": "deepseek-chat",
+            "model": model,
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
@@ -598,14 +967,37 @@ class H(BaseHTTPRequestHandler):
         delta = {"role": "assistant"}
         if text: delta["content"] = text
         if calls: delta["tool_calls"] = calls
-        chunk = {"id": comp["id"], "object": "chat.completion.chunk", "created": comp["created"], "model": "deepseek-chat",
+        chunk = {"id": comp["id"], "object": "chat.completion.chunk", "created": comp["created"], "model": model,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
         self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode())
-        fin = {"id": comp["id"], "object": "chat.completion.chunk", "created": comp["created"], "model": "deepseek-chat",
+        fin = {"id": comp["id"], "object": "chat.completion.chunk", "created": comp["created"], "model": model,
                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
         self.wfile.write(("data: " + json.dumps(fin, ensure_ascii=False) + "\n\n").encode())
         self.wfile.write(b"data: [DONE]\n\n")
 
+def _port_busy(port):
+    """True when something already accepts connections on 127.0.0.1:port.
+
+    Needed because HTTPServer sets allow_reuse_address, and on Windows
+    SO_REUSEADDR lets a SECOND socket bind the same port without error. Two
+    relays would then split incoming requests at random: intermittent 404s,
+    'session_expired' with a fresh token, and bridge jobs vanishing. A connect
+    probe is the only reliable check.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.4)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        s.close()
+
 if __name__ == "__main__":
+    if _port_busy(PORT):
+        msg = ("relay2: port %d sudah dipakai - instance lama masih jalan? "
+               "cek: netstat -ano | findstr :%d" % (PORT, PORT))
+        log(msg)
+        print("[X] " + msg, flush=True)
+        raise SystemExit(1)
     log("relay2 up on", PORT)
+    print("relay2 listening on http://127.0.0.1:%d  (Ctrl+C untuk stop)" % PORT, flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
