@@ -875,6 +875,8 @@ class H(BaseHTTPRequestHandler):
                             if not hold:
                                 self._sse(chunk({"content": text}))
                         else:
+                            if kind == "tool":
+                                log("qwen tool event:", text[:140])
                             rc = text if kind == "think" else "\n" + text + "\n"
                             self._sse(chunk({"reasoning_content": rc}))
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

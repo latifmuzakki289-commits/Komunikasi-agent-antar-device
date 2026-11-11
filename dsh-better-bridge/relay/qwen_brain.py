@@ -767,6 +767,10 @@ class QwenBrain:
         yang ditolak sebelum event pertama dilewati; sesudah ada event yang
         keluar, error dilempar apa adanya (fallback akan menggandakan output).
         """
+        # Cek cooldown WAF SEBELUM membuat chat: tanpa ini tiap request yang
+        # pasti ditolak tetap meninggalkan satu chat kosong di akun.
+        if time.time() < _waf_until:
+            raise WafBlocked("cooldown %.0fs (WAF sebelumnya)" % (_waf_until - time.time()))
         toks = _token_candidates()
         if not toks:
             raise QwenAuthFailed(
