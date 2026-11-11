@@ -1,5 +1,10 @@
 # Account/session secrets and local credentials
 .websession.json
+.websession-qwen.json
+**/.websession-qwen.json
+**/.websession.json.bak*
+**/*.py.bak*
+**/relay2*.log
 .zai-token
 .glm-auth-token
 .env
@@ -16,8 +21,11 @@
 /gateway.log
 /gateway.pid
 /glm-free-api/zai-api
+/glm-free-api/zai-api.exe
 /glm-free-api/token-collector
+/glm-free-api/token-collector.exe
 /glm-free-api/zai-bridge
+/.run/
 
 # Editor/runtime artifacts
 __pycache__/

@@ -10,6 +10,7 @@ credential web tidak disertakan.
 - `dsh-better-bridge/relay/` — relay DeepSeek web berbasis sesi akun sendiri.
 - `glm-free-api/` — source bridge Z.AI/GLM dan token collector, berdasar proyek
   [GLM-Free-API](https://github.com/izaart95-jpg/GLM-Free-API).
+- `dsh-better-bridge/relay/qwen_brain.py` dan `dsh-better-bridge/userscripts/` : backend Qwen Chat (`model: "qwen-chat"`). Panduan lengkap di `docs/QWEN-CHAT.md`.
 - `docs/PELAJARAN-PEMASANGAN.md` — catatan teknis hasil pemasangan.
 
 ## Persyaratan
