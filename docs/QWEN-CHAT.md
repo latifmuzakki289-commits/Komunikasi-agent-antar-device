@@ -66,10 +66,30 @@ Bridge dicoba lebih dulu kalau ada tab yang polling. Direct jadi cadangan.
 Kunci: `stream, version("2.1"), incremental_output, chatId, parentId(""), chat_id, chat_mode, model, parent_id(null), timestamp, messages`.
 Tidak ada field `headers`. Pesan membawa `fid, role, content, user_action:"chat", files:[], timestamp, models:[model], model:"", chat_type:"t2t", feature_config{...}, extra.meta.subChatType, sub_chat_type`.
 
+## Streaming, berpikir, dan tool
+
+Qwen mengirim beberapa fase lewat SSE: `think`, `web_search`, `code_interpreter`
+(tool bawaan Qwen, jalan di server Qwen), lalu `answer`.
+
+- Jalur direct di-stream sungguhan. `think` dan status tool dikirim ke klien
+  sebagai `reasoning_content`, `answer` sebagai `content`.
+- Jalur bridge membalas sekali di akhir dan membuang `think`/tool. Karena itu
+  default-nya direct dulu, bridge jadi cadangan (`QWEN_TRANSPORT=bridge` untuk
+  urutan lama).
+- Kalau request membawa `tools`, `answer` ditahan sampai selesai supaya blok
+  panggilan tool tidak bocor ke layar sebelum `parse_reply` memprosesnya.
+- `auto_search` dan thinking default mati: tool bawaan Qwen dan mode berpikir
+  membuat satu jawaban bisa makan puluhan detik. Pertanyaan sepele dengan
+  thinking menyala memakan sekitar 35 detik.
+- Belum diverifikasi: tampilan `reasoning_content` di klien (DSH), dan jalur
+  tahan-jawaban dengan tool call sungguhan.
+
 ## Variabel lingkungan
 
 `QWEN_SESSION_FILE`, `QWEN_IMPERSONATE` (default `firefox`), `QWEN_MODEL`,
-`QWEN_TIMEOUT`, `QWEN_BRIDGE_TIMEOUT`, `QWEN_WAF_COOLDOWN`, `QWEN_APP_VERSION`.
+`QWEN_TIMEOUT`, `QWEN_BRIDGE_TIMEOUT`, `QWEN_WAF_COOLDOWN`, `QWEN_APP_VERSION`,
+`QWEN_TRANSPORT` (`direct` default, atau `bridge`), `QWEN_AUTO_SEARCH=1`,
+`QWEN_THINKING=1`.
 
 ## Keamanan
 
