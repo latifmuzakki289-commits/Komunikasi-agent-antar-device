@@ -90,7 +90,7 @@ export GATEWAY_TOKENS="isi-token-acak-yang-kuat"
 > **Catatan Qwen:** `DEFAULT_UPSTREAMS` belum memuat Qwen, jadi `GET /v1/models`
 > di gateway tidak menampilkannya. Pakai relay langsung di
 > `http://127.0.0.1:20232/v1` untuk Qwen. Request `qwen-*` lewat gateway belum
-> saya uji.
+> diuji.
 
 ## Pemakaian di agen
 
