@@ -443,11 +443,20 @@ func mintDeviceTokens(minter *sessionMinter, total int, maxAge time.Duration) ([
 // Playwright's default args so the automation infobar flag never reaches the
 // engine.
 func launchBrowser(pw *playwright.Playwright) (playwright.Browser, error) {
-	return pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+	opts := playwright.BrowserTypeLaunchOptions{
 		Headless:          playwright.Bool(false),
-		Args:              []string{"--disable-blink-features=AutomationControlled"},
+		Args:              []string{"--disable-blink-features=AutomationControlled", "--no-sandbox"},
 		IgnoreDefaultArgs: []string{"--enable-automation"},
-	})
+	}
+	// Measured on Cue (2026-11-13): Playwright's bundled Chrome-for-Testing
+	// build is fingerprinted by the risk layer and its device sessions fail
+	// verification (F001) even headful, while the genuine Google Chrome
+	// build is trusted (T001). COLLECTOR_CHROME_PATH points the collector
+	// at a real Chrome binary, e.g. /opt/google/chrome/chrome.
+	if exe := os.Getenv("COLLECTOR_CHROME_PATH"); exe != "" {
+		opts.ExecutablePath = playwright.String(exe)
+	}
+	return pw.Chromium.Launch(opts)
 }
 
 // ---------- Core run logic ----------

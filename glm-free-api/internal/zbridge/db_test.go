@@ -260,8 +260,9 @@ func TestSwapUnderConcurrentReaders(t *testing.T) {
     var wg sync.WaitGroup
     var errs sync.Map // reader index -> first error
 
-    // Spawning readers of both kinds: tokenCount (health path) and
-    // getNextToken (captcha path).
+    // Spawning readers of both kinds: tokenCount (health path) and a
+    // non-destructive token SELECT. getNextToken now claims/deletes rows, so
+    // its destructive semantics are covered by the dedicated concurrency test.
     for i := 0; i < 8; i++ {
         wg.Add(1)
         go func(idx int) {
@@ -278,21 +279,12 @@ func TestSwapUnderConcurrentReaders(t *testing.T) {
                     }
                     return
                 }
-                if _, ok := getNextToken(); !ok {
-                    // A DB with zero rows legitimately reports !ok — only
-                    // an error state (no DB) is a failure here.
-                    h, err := activeHandle()
-                    if err != nil {
-                        if v, loaded := errs.LoadOrStore(idx, err); !loaded {
-                            t.Errorf("reader %d: %v", idx, v)
-                        }
-                        return
-                    }
-                    var n int64
-                    if err := h.db.QueryRow("SELECT COUNT(*) FROM tokens;").Scan(&n); err != nil || n == 0 {
-                        continue // empty-but-valid DB: fine
-                    }
-                    if v, loaded := errs.LoadOrStore(idx, fmt.Errorf("getNextToken failed with %d rows", n)); !loaded {
+                var token string
+                err := withTokenDB(func(h dbHandle) error {
+                    return h.db.QueryRow("SELECT token FROM tokens ORDER BY id LIMIT 1;").Scan(&token)
+                })
+                if err != nil {
+                    if v, loaded := errs.LoadOrStore(idx, err); !loaded {
                         t.Errorf("reader %d: %v", idx, v)
                     }
                     return

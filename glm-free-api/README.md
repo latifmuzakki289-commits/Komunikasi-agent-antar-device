@@ -229,7 +229,7 @@ print(resp.content[0].text)
 
 ## How It Works
 1. **Session init** — `/api/v1/auths/guest` + `/api/v1/auths/` for JWT, or `ZAI_TOKEN`; frontend version scraped from homepage.
-2. **Captcha** — per request generate `captcha_verify_param`: `InitCaptchaV3` → `certifyId`; `arg` via RC4-like cipher; `Track` JSON + `ali_hash`, zlib-compress, base64, second RC4 pass; `VerifyCaptchaV3` with pooled token → `securityToken`; final base64. Tokens FIFO from `tokens.sqlite`, deleted after use (5 retries). 90s timeout → `500`.
+2. **Captcha** — per request generate `captcha_verify_param`: `InitCaptchaV3` → `certifyId`; `arg` via RC4-like cipher; `Track` JSON + `ali_hash`, zlib-compress, base64, second RC4 pass; `VerifyCaptchaV3` with a pooled token → `securityToken`; final base64. Tokens are single-use and atomically claimed/deleted from `tokens.sqlite` before network work (`DELETE ... RETURNING`; up to 5 retries). Never split claiming into `SELECT` then later `DELETE`: agent mode has concurrent cache workers and may verify the same token twice. An empty pool can surface as `captcha generation returned empty payload` inside an HTTP 200 SSE response. 90s timeout → `500`.
 3. **Signature** — HMAC-SHA256 over `(sortedPayload | promptBase64 | timestamp)` with salted bucket key.
 4. **Streaming** — POST `/api/v2/chat/completions` with `stream:true`; parses SSE (`edit_content` + `edit_index` (UTF-16 offset, missing=0=full replace), `delta_content`, `content`, OpenAI-style deltas) re-emitted as OpenAI/Anthropic SSE. Deltas cut on rune boundaries with `STREAM_HOLDBACK` tail. Inline errors surfaced; `401` re-inits and retries once.
 5. **Session GC** — reuse up to `SESSION_REUSE_COUNT`, then delete (async restocks, sync rotates). Shutdown clears all.
@@ -239,7 +239,7 @@ Seeds `tokens.sqlite` with device tokens; Bubble Tea TUI.
 
 Browser used once per session: opens chat.z.ai, boots Aliyun-SAF SDK (registers device via `Log1`→`InitCaptchaV3`→`Log2`→`Log3`), grabs `DeviceConfig` + one genuine token as template, closes. Each token then minted in-process (refresh per-session fields 42/72/87, per-token 74 + 93/94 probe logs, AES-128-CBC seal, assemble 5-field token). One session mints arbitrary tokens, stays usable ≥35 min after browser closes (measured 18/18 over 35 min).
 
-**Browser must run headful** — headless rejected by risk layer (tokens won't verify). `Log1` bytes byte-identical to SDK; fingerprint irrelevant (foreign-machine payload still verifies).
+**Browser must run headful** — and on machines where Playwright's bundled Chrome-for-Testing build is fingerprinted by the risk layer (Aliyun verdict F001 despite headful), harvest with a genuine Google Chrome build instead: `COLLECTOR_CHROME_PATH=/opt/google/chrome/chrome ./token-collector --tokens 300` (measured on Cue, 2026-11-13: bundled build F001, genuine Chrome verified). — headless rejected by risk layer (tokens won't verify). `Log1` bytes byte-identical to SDK; fingerprint irrelevant (foreign-machine payload still verifies).
 
 ```bash
 go build -ldflags="-s -w" -trimpath -o token-collector ./cmd/token-collector
@@ -251,6 +251,8 @@ Flags: `--tokens` (0=prompt, default 850, max 1500), `--headed` (deprecated/igno
 Implementation: pure-Go SQLite (WAL, 64MB page cache, 256MB mmap); one browser visit per session; TUI ring buffer (1000 lines). Minting pure computation — one session yields whole pool; only harvest retried up to 3x.
 
 Cross-checks: `go test ./cmd/token-collector/` replays golden vectors; `.assets/scripts/live_validate.py --session-mint N --session <export>` re-mints/re-verifies live.
+
+**Captcha-pool diagnosis:** `/health` `tokenCount: 0` means no device tokens remain; a valid `ZAI_TOKEN` or successful `/api/models` request does not establish that captcha generation works. For `captcha generation returned empty payload`, check pool count and `VerifyCaptchaV3` verdicts. Agent mode runs two cache generators concurrently, so every token must be atomically dequeued once; a `SELECT` followed by a later `DELETE` can race, reuse a single-use token, and burn retries. Refill with `token-collector` after confirming depletion. A Z.AI `MODEL_CONCURRENCY_LIMIT` response is a separate upstream capacity issue, not a captcha error.
 
 ## Project Structure
 Core in `internal/zbridge`; `main.go` thin entry; blackbox tests in `tests/`, whitebox with packages.

@@ -25,6 +25,9 @@ import (
 // only call sites the captcha path needs.
 // ============================================================================
 
+// getNextToken atomically claims and removes one token from the queue.
+// Captcha cache generation is concurrent; a SELECT followed later by DELETE
+// allowed multiple workers to verify the same single-use device token.
 func getNextToken() (string, bool) {
     var token string
     err := withTokenDB(func(h dbHandle) error {
@@ -32,7 +35,11 @@ func getNextToken() (string, bool) {
             logError("Database file not found: " + h.path)
             return err
         }
-        return h.db.QueryRow("SELECT token FROM tokens ORDER BY id LIMIT 1;").Scan(&token)
+        return h.db.QueryRow(`
+            DELETE FROM tokens
+            WHERE id = (SELECT id FROM tokens ORDER BY id LIMIT 1)
+            RETURNING token;
+        `).Scan(&token)
     })
     if err != nil {
         if errors.Is(err, sql.ErrNoRows) {
@@ -40,21 +47,11 @@ func getNextToken() (string, bool) {
         } else if err == ErrDBUnavailable {
             logError(err.Error())
         } else {
-            logError("Failed to query token: " + err.Error())
+            logError("Failed to claim device token: " + err.Error())
         }
         return "", false
     }
     return token, true
-}
-
-func removeToken(token string) {
-    err := withTokenDB(func(h dbHandle) error {
-        _, err := h.db.Exec("DELETE FROM tokens WHERE token = ?;", token)
-        return err
-    })
-    if err != nil {
-        logError("Failed to delete consumed token: " + err.Error())
-    }
 }
 
 // ============================================================================
@@ -402,11 +399,10 @@ func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
             }
             return base64Encode(fpJSON), nil
         }
-        logError("VerifyCaptchaV3 succeeded but securityToken/certifyId empty for deviceToken=" + deviceToken)
-    } else if respJSON.Success {
-        logError("deviceToken failed verification (VerifyResult=false): " + deviceToken)
+        logError("VerifyCaptchaV3 succeeded but securityToken/certifyId were empty")
     } else {
-        logError("VerifyCaptchaV3 request unsuccessful for deviceToken=" + deviceToken + " response=" + resp)
+        logError(fmt.Sprintf("VerifyCaptchaV3 rejected token: success=%t code=%s verifyCode=%s message=%q requestId=%s",
+            respJSON.Success, respJSON.Code, respJSON.Result.VerifyCode, respJSON.Message, respJSON.RequestID))
     }
     return "", nil
 }
@@ -423,19 +419,18 @@ func computeFinalPayload() string {
                 attempt+1, maxTokenRetries))
             return ""
         }
-        logInfo(fmt.Sprintf("Attempt %d/%d using deviceToken=%s",
-            attempt+1, maxTokenRetries, deviceToken))
+        logInfo(fmt.Sprintf("Attempt %d/%d claiming one device token",
+            attempt+1, maxTokenRetries))
 
         payload, err := tryCompute(deviceToken)
         if err != nil {
-            logError(fmt.Sprintf("Attempt %d failed for deviceToken=%s: %v",
-                attempt+1, deviceToken, err))
+            logError(fmt.Sprintf("Attempt %d failed: %v", attempt+1, err))
             continue
         }
         if payload != "" {
             return payload
         }
-        logError("deviceToken=" + deviceToken + " produced empty payload, retrying")
+        logError("claimed device token produced no captcha payload, retrying")
     }
     logError(fmt.Sprintf("All %d token retries exhausted", maxTokenRetries))
     return ""
@@ -444,7 +439,6 @@ func computeFinalPayload() string {
 func tryCompute(deviceToken string) (string, error) {
     certifyID, err := initCaptcha()
     if err != nil {
-        removeToken(deviceToken)
         return "", fmt.Errorf("initCaptcha: %w", err)
     }
 
@@ -461,7 +455,6 @@ func tryCompute(deviceToken string) (string, error) {
     }
     jsonBytes, err := jsonMarshal(track)
     if err != nil {
-        removeToken(deviceToken)
         return "", err
     }
 
@@ -471,9 +464,7 @@ func tryCompute(deviceToken string) (string, error) {
     fb64 := base64Encode(compressed)
     finalVal := encrypt([]byte(fb64))
 
-    // Always remove token after use — prevents conflicts
-    removeToken(deviceToken)
-
+    // The token was atomically claimed from SQLite by getNextToken.
     payload, err := verifyCaptcha(certifyID, finalVal, deviceToken)
     if err != nil {
         return "", fmt.Errorf("verifyCaptcha: %w", err)
@@ -541,7 +532,7 @@ func (c *CaptchaCache) Run() {
 
     for range ticker.C {
         c.mu.Lock()
-        
+
         // If no activity in the last 3 minutes, pause generation to save tokens
         if time.Since(c.lastActive) > 3*time.Minute {
             c.active = false
@@ -576,7 +567,7 @@ func (c *CaptchaCache) Run() {
 func (c *CaptchaCache) generate() {
     startedAt := time.Now()
     payload := computeFinalPayload()
-    
+
     c.mu.Lock()
     c.generating--
     if payload != "" {
@@ -651,4 +642,3 @@ func getCaptchaVerifyParam() (string, error) {
         return "", errors.New("captcha generation timeout after 90s")
     }
 }
-
