@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="440" viewBox="0 0 1600 440" role="img" aria-label="Ringkasan tiga backend: DeepSeek Web, GLM Z.AI, dan Qwen Chat">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070b16"/>
+      <stop offset="0.55" stop-color="#0a1020"/>
+      <stop offset="1" stop-color="#0d1428"/>
+    </linearGradient>
+
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#8aa2c8" stroke-opacity="0.06" stroke-width="1"/>
+    </pattern>
+
+    <linearGradient id="cardBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0f182e" stop-opacity="0.96"/>
+      <stop offset="1" stop-color="#0a1122" stop-opacity="0.96"/>
+    </linearGradient>
+
+    <radialGradient id="glowBlue" cx="0.2" cy="0.0" r="0.85">
+      <stop offset="0" stop-color="#3b82f6" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#3b82f6" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="glowGreen" cx="0.2" cy="0.0" r="0.85">
+      <stop offset="0" stop-color="#10b981" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="glowViolet" cx="0.2" cy="0.0" r="0.85">
+      <stop offset="0" stop-color="#8b5cf6" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="barBlue" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="0.6" stop-color="#4dabf7"/>
+      <stop offset="1" stop-color="#9cc4ff" stop-opacity="0.35"/>
+    </linearGradient>
+
+    <linearGradient id="barGreen" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#10b981"/>
+      <stop offset="0.6" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#a7f3d0" stop-opacity="0.35"/>
+    </linearGradient>
+
+    <linearGradient id="barViolet" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="0.6" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#d6c6ff" stop-opacity="0.35"/>
+    </linearGradient>
+
+    <clipPath id="clipCard1"><rect x="40" y="84" width="484" height="316" rx="14"/></clipPath>
+    <clipPath id="clipCard2"><rect x="558" y="84" width="484" height="316" rx="14"/></clipPath>
+    <clipPath id="clipCard3"><rect x="1076" y="84" width="484" height="316" rx="14"/></clipPath>
+
+    <style>
+      .sans { font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif; }
+      .mono { font-family: 'Cascadia Code', 'Consolas', 'SFMono-Regular', Menlo, Monaco, monospace; }
+    </style>
+  </defs>
+
+  <!-- Canvas -->
+  <rect width="1600" height="440" fill="url(#bg)"/>
+  <rect width="1600" height="440" fill="url(#grid)"/>
+
+  <!-- Header strip -->
+  <circle cx="50" cy="46" r="4.5" fill="#7fa8ff"/>
+  <circle cx="50" cy="46" r="9" fill="#7fa8ff" fill-opacity="0.2"/>
+  <text x="68" y="51" class="sans" font-size="14" font-weight="600" fill="#94a3b8" letter-spacing="2.2">TIGA BACKEND WEB · SATU FORMAT OPENAI</text>
+
+  <g transform="translate(1272, 28)">
+    <rect width="288" height="34" rx="17" fill="#101b33" stroke="#283d66" stroke-width="1"/>
+    <circle cx="20" cy="17" r="4" fill="#60a5fa"/>
+    <text x="34" y="21.5" class="mono" font-size="13.5" fill="#dbeafe">gateway.py :8080 · 127.0.0.1</text>
+  </g>
+
+  <!-- ==================== CARD 1: DEEPSEEK ==================== -->
+  <g>
+    <g clip-path="url(#clipCard1)">
+      <rect x="40" y="84" width="484" height="316" fill="url(#cardBg)"/>
+      <rect x="40" y="84" width="484" height="190" fill="url(#glowBlue)"/>
+      <rect x="40" y="84" width="484" height="4" fill="url(#barBlue)"/>
+    </g>
+    <rect x="40" y="84" width="484" height="316" rx="14" fill="none" stroke="#223556" stroke-width="1.2"/>
+
+    <!-- Header -->
+    <circle cx="72" cy="128" r="6" fill="#4dabf7"/>
+    <text x="90" y="136" class="sans" font-size="24" font-weight="700" fill="#f1f5f9">DeepSeek Web</text>
+    <text x="66" y="162" class="mono" font-size="14" fill="#7fa8ff">chat.deepseek.com</text>
+
+    <!-- Status Badge -->
+    <rect x="358" y="112" width="140" height="28" rx="14" fill="#102544" stroke="#3b82f6" stroke-opacity="0.5" stroke-width="1"/>
+    <text x="428" y="131" text-anchor="middle" class="mono" font-size="12" font-weight="600" fill="#93c5fd">GATEWAY :8080</text>
+
+    <!-- Divider -->
+    <line x1="66" y1="184" x2="498" y2="184" stroke="#1e2f4d" stroke-width="1"/>
+
+    <!-- Specs -->
+    <text x="66" y="216" class="sans" font-size="13" font-weight="600" fill="#64748b">MODEL</text>
+    <text x="176" y="216" class="mono" font-size="14.5" fill="#e2e8f0">deepseek-chat</text>
+
+    <text x="66" y="252" class="sans" font-size="13" font-weight="600" fill="#64748b">KOMPONEN</text>
+    <text x="176" y="252" class="mono" font-size="14.5" fill="#e2e8f0">relay2.py · :20232</text>
+
+    <text x="66" y="288" class="sans" font-size="13" font-weight="600" fill="#64748b">MEKANISME</text>
+    <text x="176" y="288" class="mono" font-size="14" fill="#cbd5e1">PoW solver + .websession.json</text>
+
+    <!-- Footer chips -->
+    <g transform="translate(66, 336)">
+      <rect width="102" height="30" rx="7" fill="#12213a" stroke="#29446e" stroke-width="1"/>
+      <text x="51" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#bfdbfe">Streaming</text>
+
+      <rect x="112" width="116" height="30" rx="7" fill="#12213a" stroke="#29446e" stroke-width="1"/>
+      <text x="170" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#bfdbfe">Tool Calling</text>
+
+      <rect x="238" width="90" height="30" rx="7" fill="#12213a" stroke="#29446e" stroke-width="1"/>
+      <text x="283" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#bfdbfe">Failover</text>
+    </g>
+  </g>
+
+  <!-- ==================== CARD 2: GLM (Z.AI) ==================== -->
+  <g>
+    <g clip-path="url(#clipCard2)">
+      <rect x="558" y="84" width="484" height="316" fill="url(#cardBg)"/>
+      <rect x="558" y="84" width="484" height="190" fill="url(#glowGreen)"/>
+      <rect x="558" y="84" width="484" height="4" fill="url(#barGreen)"/>
+    </g>
+    <rect x="558" y="84" width="484" height="316" rx="14" fill="none" stroke="#1e3d3a" stroke-width="1.2"/>
+
+    <!-- Header -->
+    <circle cx="590" cy="128" r="6" fill="#34d399"/>
+    <text x="608" y="136" class="sans" font-size="24" font-weight="700" fill="#f1f5f9">GLM (Z.AI)</text>
+    <text x="584" y="162" class="mono" font-size="14" fill="#6ee7b7">chat.z.ai</text>
+
+    <!-- Status Badge -->
+    <rect x="876" y="112" width="140" height="28" rx="14" fill="#0d2b24" stroke="#10b981" stroke-opacity="0.5" stroke-width="1"/>
+    <text x="946" y="131" text-anchor="middle" class="mono" font-size="12" font-weight="600" fill="#6ee7b7">GATEWAY :8080</text>
+
+    <!-- Divider -->
+    <line x1="584" y1="184" x2="1016" y2="184" stroke="#1c3536" stroke-width="1"/>
+
+    <!-- Specs -->
+    <text x="584" y="216" class="sans" font-size="13" font-weight="600" fill="#64748b">MODEL</text>
+    <text x="694" y="216" class="mono" font-size="14.5" fill="#e2e8f0">glm-5.3 · 5.2 · 5.3-flash · 4.7</text>
+
+    <text x="584" y="252" class="sans" font-size="13" font-weight="600" fill="#64748b">KOMPONEN</text>
+    <text x="694" y="252" class="mono" font-size="14.5" fill="#e2e8f0">zai-api (Go) · :20234</text>
+
+    <text x="584" y="288" class="sans" font-size="13" font-weight="600" fill="#64748b">MEKANISME</text>
+    <text x="694" y="288" class="mono" font-size="14" fill="#cbd5e1">Agent mode + WAF breaker</text>
+
+    <!-- Footer chips -->
+    <g transform="translate(584, 336)">
+      <rect width="102" height="30" rx="7" fill="#0f2824" stroke="#1e5247" stroke-width="1"/>
+      <text x="51" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#a7f3d0">Streaming</text>
+
+      <rect x="112" width="164" height="30" rx="7" fill="#0f2824" stroke="#1e5247" stroke-width="1"/>
+      <text x="194" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#a7f3d0">OpenAI + Anthropic</text>
+
+      <rect x="286" width="90" height="30" rx="7" fill="#0f2824" stroke="#1e5247" stroke-width="1"/>
+      <text x="331" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#a7f3d0">Failover</text>
+    </g>
+  </g>
+
+  <!-- ==================== CARD 3: QWEN CHAT ==================== -->
+  <g>
+    <g clip-path="url(#clipCard3)">
+      <rect x="1076" y="84" width="484" height="316" fill="url(#cardBg)"/>
+      <rect x="1076" y="84" width="484" height="190" fill="url(#glowViolet)"/>
+      <rect x="1076" y="84" width="484" height="4" fill="url(#barViolet)"/>
+    </g>
+    <rect x="1076" y="84" width="484" height="316" rx="14" fill="none" stroke="#312854" stroke-width="1.2"/>
+
+    <!-- Header -->
+    <circle cx="1108" cy="128" r="6" fill="#a78bfa"/>
+    <text x="1126" y="136" class="sans" font-size="24" font-weight="700" fill="#f1f5f9">Qwen Chat</text>
+    <text x="1102" y="162" class="mono" font-size="14" fill="#c4b5fd">chat.qwen.ai</text>
+
+    <!-- Status Badge -->
+    <rect x="1394" y="112" width="140" height="28" rx="14" fill="#21173b" stroke="#8b5cf6" stroke-opacity="0.55" stroke-width="1"/>
+    <text x="1464" y="131" text-anchor="middle" class="mono" font-size="12" font-weight="600" fill="#d8b4fe">RELAY :20232</text>
+
+    <!-- Divider -->
+    <line x1="1102" y1="184" x2="1534" y2="184" stroke="#2c2448" stroke-width="1"/>
+
+    <!-- Specs -->
+    <text x="1102" y="216" class="sans" font-size="13" font-weight="600" fill="#64748b">MODEL</text>
+    <text x="1212" y="216" class="mono" font-size="14.5" fill="#e2e8f0">qwen-chat (qwen3.7-plus)</text>
+
+    <text x="1102" y="252" class="sans" font-size="13" font-weight="600" fill="#64748b">KOMPONEN</text>
+    <text x="1212" y="252" class="mono" font-size="14.5" fill="#e2e8f0">relay2 + qwen_brain · :20232</text>
+
+    <text x="1102" y="288" class="sans" font-size="13" font-weight="600" fill="#64748b">MEKANISME</text>
+    <text x="1212" y="288" class="mono" font-size="14" fill="#cbd5e1">curl_cffi direct + bridge tab</text>
+
+    <!-- Footer chips -->
+    <g transform="translate(1102, 336)">
+      <rect width="102" height="30" rx="7" fill="#1d1636" stroke="#453375" stroke-width="1"/>
+      <text x="51" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#ddd6fe">Streaming</text>
+
+      <rect x="112" width="162" height="30" rx="7" fill="#1d1636" stroke="#453375" stroke-width="1"/>
+      <text x="193" y="20" text-anchor="middle" class="mono" font-size="12.5" font-weight="600" fill="#ddd6fe">reasoning_content</text>
+
+      <rect x="284" width="102" height="30" rx="7" fill="#1d1636" stroke="#453375" stroke-width="1"/>
+      <text x="335" y="20" text-anchor="middle" class="sans" font-size="13" font-weight="600" fill="#ddd6fe">Userscript</text>
+    </g>
+  </g>
+
+  <!-- Outer frame matching banner.svg -->
+  <rect x="0.5" y="0.5" width="1599" height="439" fill="none" stroke="#22304a" stroke-opacity="0.7" stroke-width="1"/>
+</svg>
