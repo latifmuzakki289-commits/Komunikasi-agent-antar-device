@@ -49,8 +49,8 @@ type ZAIResult struct {
 }
 
 type SendOptions struct {
-    Model             string
-    WebSearch         *bool
+    Model     string
+    WebSearch *bool
     // AdvancedSearch enables Z.AI's "Advanced Search" (the MCP variant of
     // web search from chat.z.ai): it attaches the top-level
     // "mcp_servers": ["advanced-search"] field to the upstream
@@ -101,9 +101,13 @@ type CVP struct {
 }
 
 type VerifyCaptchaResponse struct {
-    Success bool `json:"Success"`
-    Result  struct {
+    Success   bool   `json:"Success"`
+    Code      string `json:"Code"`
+    Message   string `json:"Message"`
+    RequestID string `json:"RequestId"`
+    Result    struct {
         VerifyResult  bool   `json:"VerifyResult"`
+        VerifyCode    string `json:"VerifyCode"`
         SecurityToken string `json:"securityToken"`
         CertifyID     string `json:"certifyId"`
     } `json:"Result"`

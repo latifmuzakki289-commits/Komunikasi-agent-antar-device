@@ -8,6 +8,7 @@
 tokens.sqlite
 tokens.sqlite-shm
 tokens.sqlite-wal
+tokens.sqlite.bak-*
 *.log
 
 # Local environment
