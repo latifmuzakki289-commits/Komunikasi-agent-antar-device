@@ -43,6 +43,10 @@ type Config struct {
         Default int
     }
     ZaiToken  string
+    // CaptchaSolverURL points at cmd/captcha-solver (POST /solve). When set,
+    // captcha generation is delegated to that browser-backed service instead
+    // of the legacy in-process arg/track synthesis (CAPTCHA_SOLVER_URL).
+    CaptchaSolverURL string
     AgentMode bool
     // AgentModeVariant selects the agent-mode compatibility shim:
     //   "modern" (default) — XML-sectioned prompt shim ported from
@@ -218,10 +222,17 @@ func loadConfig() *Config {
             c.SessionReuseCount = n
         }
     }
+    if s := strings.TrimSpace(os.Getenv("CAPTCHA_SOLVER_URL")); s != "" {
+        c.CaptchaSolverURL = s
+    }
     return c
 }
 
 var config = loadConfig()
+
+// CaptchaSolverURL is the resolved solver endpoint; empty keeps the legacy
+// in-process captcha path.
+var CaptchaSolverURL = config.CaptchaSolverURL
 
 // agentModern reports whether the modern agent-mode shim (XML-sectioned
 // prompt, tolerant marker/payload parsing — see agent.go) is active.

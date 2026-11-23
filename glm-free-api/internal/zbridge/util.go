@@ -42,8 +42,14 @@ func init() {
 }
 
 // ============================================================================
-// LOGGING — silent unless --verbose
+// LOGGING - silent unless --verbose
 // ============================================================================
+
+// SetVerbose enables the package's diagnostic logging. The solver command uses
+// it to surface VerifyCaptchaV3 verdicts (F001/F008/T001) in its own output.
+func SetVerbose(v bool) {
+    verbose = v
+}
 
 func logError(msg string) {
     if !verbose {
