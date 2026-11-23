@@ -407,11 +407,35 @@ func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
     return "", nil
 }
 
+// VerifyCVParam submits a transplanted payload to VerifyCaptchaV3. It is the
+// entry point used by cmd/captcha-solver: the certificate, data blob and
+// device token all come from the same live SDK challenge, and the return
+// value is the base64 captcha_verify_param expected by Z.AI.
+func VerifyCVParam(certifyID, dataValue, deviceToken string) (string, error) {
+    if certifyID == "" || dataValue == "" || deviceToken == "" {
+        return "", errors.New("verify: certifyId, data and deviceToken are required")
+    }
+    return verifyCaptcha(certifyID, dataValue, deviceToken)
+}
+
 // ============================================================================
-// COMPUTE FINAL PAYLOAD — tries tokens until success or exhausted
+// COMPUTE FINAL PAYLOAD - tries tokens until success or exhausted
 // ============================================================================
 
 func computeFinalPayload() string {
+    // Browser-backed solver: the SDK's `arg` and telemetry are captured from a
+    // real challenge, transplanted, and verified. The legacy synthesis below
+    // cannot produce a verifiable payload because `arg` is not derivable from
+    // the certificate id alone.
+    if CaptchaSolverURL != "" {
+        payload, err := solverParam(CaptchaSolverURL)
+        if err != nil {
+            logError("[Captcha] solver: " + err.Error())
+            return ""
+        }
+        return payload
+    }
+
     for attempt := 0; attempt < maxTokenRetries; attempt++ {
         deviceToken, ok := getNextToken()
         if !ok {
