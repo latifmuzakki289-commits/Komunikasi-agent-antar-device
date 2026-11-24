@@ -50,13 +50,16 @@ type config struct {
 	pageURL  string
 	headless bool
 	attempts int
+	chrome   string
+	parallel int
 }
 
 type solver struct {
 	cfg     config
 	browser playwright.Browser
 
-	mu      sync.Mutex // one challenge at a time
+	mu      sync.Mutex // protects counters
+	sem     chan struct{}
 	solves  int64
 	fails   int64
 	lastErr string
@@ -71,10 +74,18 @@ func main() {
 	flag.StringVar(&cfg.pageURL, "page", "https://chat.z.ai/", "page that hosts the SDK (its origin matters)")
 	flag.BoolVar(&cfg.headless, "headless", false, "run Chromium headless (Aliyun may reject the session)")
 	flag.IntVar(&cfg.attempts, "attempts", 3, "challenges to try per request")
+	flag.StringVar(&cfg.chrome, "chrome", os.Getenv("CAPTCHA_SOLVER_CHROME"), "Chrome/Chromium binary to drive (default: Playwright bundled)")
+	flag.IntVar(&cfg.parallel, "parallel", 4, "concurrent challenges (each uses its own browser context)")
 	flag.Parse()
 	zbridge.SetVerbose(true) // log VerifyCaptchaV3 verdicts
 
-	if err := playwright.Install(&playwright.RunOptions{Browsers: []string{"chromium"}}); err != nil {
+	// A system Chrome can be supplied when the risk layer fingerprints the
+	// bundled Chromium build; only the driver is needed in that case.
+	if cfg.chrome != "" {
+		if err := playwright.Install(&playwright.RunOptions{SkipInstallBrowsers: true}); err != nil {
+			log.Printf("playwright install: %v (continuing)", err)
+		}
+	} else if err := playwright.Install(&playwright.RunOptions{Browsers: []string{"chromium"}}); err != nil {
 		log.Printf("playwright install: %v (continuing)", err)
 	}
 	pw, err := playwright.Run()
@@ -85,17 +96,21 @@ func main() {
 
 	// Headed is the configuration Aliyun trusts; keep the automation flag out
 	// of the engine exactly like the token collector does.
-	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+	launchOpts := playwright.BrowserTypeLaunchOptions{
 		Headless:          playwright.Bool(cfg.headless),
 		Args:              []string{"--disable-blink-features=AutomationControlled"},
 		IgnoreDefaultArgs: []string{"--enable-automation"},
-	})
+	}
+	if cfg.chrome != "" {
+		launchOpts.ExecutablePath = playwright.String(cfg.chrome)
+	}
+	browser, err := pw.Chromium.Launch(launchOpts)
 	if err != nil {
 		log.Fatalf("browser launch: %v", err)
 	}
 	defer browser.Close()
 
-	s := &solver{cfg: cfg, browser: browser}
+	s := &solver{cfg: cfg, browser: browser, sem: make(chan struct{}, cfg.parallel)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
@@ -109,7 +124,7 @@ func main() {
 		_ = srv.Close()
 	}()
 
-	log.Printf("captcha-solver on %s (scene=%s, headless=%v, page=%s)", cfg.addr, cfg.scene, cfg.headless, cfg.pageURL)
+	log.Printf("captcha-solver on %s (scene=%s, headless=%v, page=%s, chrome=%q, parallel=%d)", cfg.addr, cfg.scene, cfg.headless, cfg.pageURL, cfg.chrome, cfg.parallel)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve: %v", err)
 	}
@@ -138,21 +153,31 @@ func (s *solver) handleSolve(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Each challenge gets its own browser context, so solves may run in
+	// parallel; the semaphore bounds how many Chrome pages are live at once.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-r.Context().Done():
+		return
+	}
 
 	param, cert, err := s.solve()
 	if err != nil {
+		s.mu.Lock()
 		s.fails++
 		s.lastErr = err.Error()
+		s.mu.Unlock()
 		log.Printf("solve failed: %v", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	s.mu.Lock()
 	s.solves++
 	s.lastErr = ""
+	s.mu.Unlock()
 	log.Printf("solved cert=%s param=%d bytes", cert, len(param))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"param": param, "cert": cert})
